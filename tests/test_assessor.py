@@ -3,27 +3,48 @@
 from src.enrichment.assessor import parse_assessor_html, AssessorRecord
 
 
-# Minimal HTML fixture mimicking the DevNetWedge <dt>/<dd> structure.
+# Minimal HTML fixture mimicking the DevNetWedge inner-label/inner-value structure.
 SAMPLE_HTML = """
 <html><body>
-<dl>
-  <dt>Owner Name</dt>
-  <dd>ALLEN, RUTH</dd>
-  <dt>Site Address</dt>
-  <dd>209 EDWARDS ST CAHOKIA, IL 62206</dd>
-  <dt>Mailing Address</dt>
-  <dd>ALLEN, RUTH 209 EDWRADS ST CAHOKIA, IL 62206</dd>
-  <dt>Property Class</dt>
-  <dd>0040 - Improved Lots</dd>
-  <dt>Acres</dt>
-  <dd>0.2500</dd>
-  <dt>Net Taxable Value</dt>
-  <dd>12,952</dd>
-  <dt>Tax Rate</dt>
-  <dd>19.022200</dd>
-  <dt>Total Tax</dt>
-  <dd>$2,463.76</dd>
-</dl>
+<table>
+  <td>
+    <div class="inner-label">Owner Name &amp; Address</div>
+    <div class="inner-value" style="white-space:pre-line">ALLEN, RUTH
+209 EDWARDS ST
+CAHOKIA, IL 62206</div>
+  </td>
+  <td>
+    <div class="inner-label">Site Address</div>
+    <div class="inner-value whitespace-pre-line">209 EDWARDS ST
+CAHOKIA, IL 62206</div>
+  </td>
+  <td>
+    <div class="inner-label">Mailing Address</div>
+    <div class="inner-value" style="white-space:pre-line">ALLEN, RUTH
+209 EDWRADS ST
+CAHOKIA, IL 62206</div>
+  </td>
+  <td>
+    <div class="inner-label">Property Class</div>
+    <div class="inner-value">0040 - Improved Lots</div>
+  </td>
+  <td>
+    <div class="inner-label">Acres</div>
+    <div class="inner-value">0.2500</div>
+  </td>
+  <td>
+    <div class="inner-label">Net Taxable Value</div>
+    <div class="inner-value">12,952</div>
+  </td>
+  <td>
+    <div class="inner-label">Tax Rate</div>
+    <div class="inner-value">19.022200</div>
+  </td>
+  <td>
+    <div class="inner-label">Total Tax</div>
+    <div class="inner-value">$2,463.76</div>
+  </td>
+</table>
 </body></html>
 """
 
@@ -32,8 +53,14 @@ SAMPLE_HTML_TAX_SOLD = SAMPLE_HTML.replace(
 )
 
 SAMPLE_HTML_ABSENTEE = SAMPLE_HTML.replace(
-    "<dt>Mailing Address</dt>\n  <dd>ALLEN, RUTH 209 EDWRADS ST CAHOKIA, IL 62206</dd>",
-    "<dt>Mailing Address</dt>\n  <dd>ALLEN, RUTH 456 OAK AVE ST LOUIS, MO 63101</dd>",
+    """<div class="inner-label">Mailing Address</div>
+    <div class="inner-value" style="white-space:pre-line">ALLEN, RUTH
+209 EDWRADS ST
+CAHOKIA, IL 62206</div>""",
+    """<div class="inner-label">Mailing Address</div>
+    <div class="inner-value" style="white-space:pre-line">ALLEN, RUTH
+456 OAK AVE
+ST LOUIS, MO 63101</div>""",
 )
 
 
@@ -44,7 +71,8 @@ class TestParseAssessorHtml:
 
     def test_parses_site_address(self):
         record = parse_assessor_html(SAMPLE_HTML, "01-35-0-402-022")
-        assert record.property_address == "209 EDWARDS ST CAHOKIA, IL 62206"
+        assert "209 EDWARDS ST" in record.property_address
+        assert "CAHOKIA, IL 62206" in record.property_address
 
     def test_parses_assessed_value(self):
         record = parse_assessor_html(SAMPLE_HTML, "01-35-0-402-022")

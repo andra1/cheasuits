@@ -58,13 +58,14 @@ class AssessorRecord:
         return {k: v for k, v in d.items() if v is not None and v != ""}
 
 
-def _get_dd_text(soup: BeautifulSoup, dt_label: str) -> str:
-    """Find a <dt> by text and return the next <dd>'s text content."""
-    dt = soup.find("dt", string=re.compile(re.escape(dt_label), re.IGNORECASE))
-    if dt:
-        dd = dt.find_next_sibling("dd")
-        if dd:
-            return dd.get_text(strip=True)
+def _get_field_text(soup: BeautifulSoup, label: str) -> str:
+    """Find a div.inner-label by text and return the sibling div.inner-value text."""
+    label_div = soup.find("div", class_="inner-label",
+                          string=re.compile(re.escape(label), re.IGNORECASE))
+    if label_div:
+        val_div = label_div.find_next_sibling("div", class_="inner-value")
+        if val_div:
+            return val_div.get_text(strip=True)
     return ""
 
 
@@ -83,22 +84,25 @@ def parse_assessor_html(html: str, parcel_id: str) -> AssessorRecord:
     """Parse a DevNetWedge property page into an AssessorRecord."""
     soup = BeautifulSoup(html, "html.parser")
 
-    owner_name = _get_dd_text(soup, "Owner Name")
-    property_address = _get_dd_text(soup, "Site Address")
-    mailing_address = _get_dd_text(soup, "Mailing Address")
-    property_class = _get_dd_text(soup, "Property Class")
+    # "Owner Name & Address" field contains owner name + address on separate lines
+    owner_block = _get_field_text(soup, "Owner Name")
+    owner_name = owner_block.split("\n")[0].strip() if owner_block else ""
 
-    acres_text = _get_dd_text(soup, "Acres")
+    property_address = _get_field_text(soup, "Site Address")
+    mailing_address = _get_field_text(soup, "Mailing Address")
+    property_class = _get_field_text(soup, "Property Class")
+
+    acres_text = _get_field_text(soup, "Acres")
     acres = float(acres_text) if acres_text else None
 
-    net_taxable_text = _get_dd_text(soup, "Net Taxable Value")
+    net_taxable_text = _get_field_text(soup, "Net Taxable Value")
     net_taxable_value = _parse_currency(net_taxable_text)
 
-    tax_rate_text = _get_dd_text(soup, "Tax Rate")
-    tax_rate = float(tax_rate_text) if tax_rate_text else None
+    tax_rate_text = _get_field_text(soup, "Tax Rate")
+    tax_rate = float(re.sub(r"[^\d.]", "", tax_rate_text)) if tax_rate_text and tax_rate_text != "Unavailable" else None
 
-    total_tax_text = _get_dd_text(soup, "Total Tax")
-    total_tax = _parse_currency(total_tax_text)
+    total_tax_text = _get_field_text(soup, "Total Tax")
+    total_tax = _parse_currency(total_tax_text) if total_tax_text != "Unavailable" else None
 
     # Detect tax sale status
     page_text = soup.get_text()
