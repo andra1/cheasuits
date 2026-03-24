@@ -56,6 +56,7 @@ Each module is independently runnable. The DB is the shared interface between th
 | `property_class` | TEXT | assessor | e.g. "0040 - Improved Lots" |
 | `acres` | REAL | assessor | |
 | `enriched_at` | TEXT | assessor | ISO timestamp, NULL if not yet enriched |
+| `enrichment_error` | TEXT | assessor | Error message if enrichment failed, NULL otherwise. Rows with this set are skipped on re-run. |
 | `lat` | REAL | prepare_data | From ArcGIS geocoding |
 | `lng` | REAL | prepare_data | |
 | `geocoded_at` | TEXT | prepare_data | ISO timestamp, NULL if not yet geocoded |
@@ -71,11 +72,11 @@ Each module is independently runnable. The DB is the shared interface between th
 
 Thin wrapper around Python's `sqlite3`. Provides:
 
-- `get_db(db_path) -> Connection` — opens/creates DB, runs schema migration if table doesn't exist
-- `upsert_records(conn, records: list[dict])` — INSERT OR REPLACE by `document_number`
-- `get_unenriched(conn) -> list[dict]` — rows where `enriched_at IS NULL` and `parcel_id` is not empty
+- `get_db(db_path) -> Connection` — opens/creates DB, enables WAL journal mode, runs schema migration if table doesn't exist
+- `upsert_records(conn, records: list[dict])` — uses `INSERT ... ON CONFLICT(document_number) DO UPDATE SET` with **only** the ava_search-owned columns (case_number, case_type, etc.). This preserves enrichment and geocoding data on re-scrape. Never use `INSERT OR REPLACE` as it deletes the entire row first.
+- `get_unenriched(conn) -> list[dict]` — rows where `enriched_at IS NULL` and `enrichment_error IS NULL` and `parcel_id != ''`
 - `update_enrichment(conn, document_number, fields: dict)` — set assessor fields + `enriched_at`
-- `get_ungecoded(conn) -> list[dict]` — rows where `geocoded_at IS NULL` and `parcel_id` is not empty
+- `get_ungeocoded(conn) -> list[dict]` — rows where `geocoded_at IS NULL` and `parcel_id != ''`
 - `update_geocoding(conn, document_number, lat, lng)` — set lat/lng + `geocoded_at`
 - `get_all(conn) -> list[dict]` — all rows, for dashboard export
 
@@ -86,9 +87,13 @@ No ORM. Plain SQL. The schema is simple enough that SQLAlchemy/Alembic would be 
 ### Scraper
 
 - **URL pattern:** `https://stclairil.devnetwedge.com/parcel/view/{parcel_no_hyphens}/{tax_year}`
+- **Parcel ID transformation:** Strip hyphens before constructing URL (`01-35-0-402-022` -> `01350402022`). Use shared `strip_parcel_hyphens()` from `src/utils/parsing.py`.
+- **Tax year default:** `datetime.now().year - 1` (assessments lag by one year). Override with `--year`.
 - **Method:** HTTP GET, no auth required
 - **Parser:** `BeautifulSoup` to extract fields from the HTML
 - **Rate limiting:** 0.3s between requests
+- **Retries:** 3 attempts per parcel with 1s backoff (matching existing geocoder pattern in `prepare_data.py`)
+- **Error handling:** HTTP 404 or empty page -> log warning, skip parcel. HTTP 429/5xx -> retry with backoff. After max retries, record failure and move on. Failed parcels are skipped on re-run (see `enrichment_error` column below).
 - **Caching:** In-memory dict keyed by parcel ID (same parcel can appear in multiple filings)
 
 ### Data Class
@@ -100,7 +105,7 @@ class AssessorRecord:
     owner_name: str = ""
     property_address: str = ""
     mailing_address: str = ""
-    absentee_owner: bool = False
+    absentee_owner: bool = False     # stored as INTEGER 0/1 in SQLite
     assessed_value: float | None = None
     net_taxable_value: float | None = None
     tax_rate: float | None = None
@@ -130,7 +135,7 @@ python -m src.ingestion.ava_search --days 30 --db data/cheasuits.db
 ```
 
 - When `--db` is provided, upserts records to the database instead of (or in addition to) CSV
-- Parcel IDs and subdivisions are parsed from the legals field before insertion (reuse `parse_legals` from prepare_data.py, or move it to a shared util)
+- Parcel IDs and subdivisions are parsed from the legals field before insertion using shared `parse_legals` from `src/utils/parsing.py`
 - `--output` CSV flag still works for backwards compatibility
 
 ## Modified Module: `src/visualization/prepare_data.py`
@@ -144,7 +149,7 @@ python -m src.visualization.prepare_data [--db data/cheasuits.db]
 - When `--db` is provided, reads from DB instead of CSV
 - Geocodes rows where `geocoded_at IS NULL`, updates DB with results
 - Writes `dashboard/public/data.json` from all DB rows (enriched data included)
-- The `data.json` schema gains new fields from the assessor data so the dashboard can display them
+- The `data.json` features array gains these fields from the assessor: `owner_name`, `property_address`, `mailing_address`, `absentee_owner`, `assessed_value`, `net_taxable_value`, `tax_status`, `property_class`, `acres`. The dashboard UI does not need to change yet — extra fields in `data.json` are harmless and available when the UI is updated later.
 
 ## Pipeline
 
@@ -168,14 +173,22 @@ No new dependencies for SQLite (stdlib) or HTTP (already using `urllib`).
 
 | File | Action |
 |---|---|
+| `src/utils/__init__.py` | New (empty) |
+| `src/utils/parsing.py` | New — shared `parse_legals`, `strip_parcel_hyphens` |
 | `src/db/__init__.py` | New (empty) |
 | `src/db/database.py` | New — SQLite helper |
 | `src/enrichment/__init__.py` | New (empty) |
 | `src/enrichment/assessor.py` | New — DevNetWedge scraper |
 | `src/ingestion/ava_search.py` | Modify — add `--db` flag, upsert to DB |
-| `src/visualization/prepare_data.py` | Modify — add `--db` flag, read/write DB |
+| `src/visualization/prepare_data.py` | Modify — add `--db` flag, read/write DB, import from `src/utils/parsing.py` |
 | `requirements.txt` | Modify — add `beautifulsoup4` |
+| `.gitignore` | Modify — add `data/*.db` |
 | `data/.gitkeep` | New — ensure data dir exists in repo |
+
+## Known Limitations
+
+- **Multi-parcel filings reduced to first parcel.** Some lis pendens filings reference multiple parcels (e.g., document 2224005 has two). Only the first parcel ID is stored and enriched. Additional parcels are preserved in `legals_raw` for future use.
+- **Absentee owner detection is a simple string comparison.** `absentee_owner` is set to 1 when `mailing_address != property_address` (case-insensitive, stripped). No address normalization (e.g., "St" vs "Street"). Good enough for obvious cases; can be refined later.
 
 ## Out of Scope
 
