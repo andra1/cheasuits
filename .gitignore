@@ -33,3 +33,5 @@ data/processed/
 
 # Jupyter
 .ipynb_checkpoints/
+.vercel
+data/*.db
