@@ -73,6 +73,74 @@ def read_csv(csv_path: Path) -> list[dict]:
     return records
 
 
+def read_db(db_path: Path) -> list[dict]:
+    """Read property records from the SQLite database."""
+    from src.db.database import get_db, get_all, get_ungeocoded, update_geocoding
+
+    conn = get_db(db_path)
+    rows = get_all(conn)
+
+    logger.info(f"Read {len(rows)} records from {db_path}")
+
+    # Geocode rows that need it
+    ungeocoded = get_ungeocoded(conn)
+    if ungeocoded:
+        print(f"Geocoding {len(ungeocoded)} new parcels via ArcGIS...")
+        seen: dict[str, tuple[float, float] | None] = {}
+        geocoded_count = 0
+
+        for i, row in enumerate(ungeocoded):
+            parcel_id = row["parcel_id"]
+
+            if parcel_id in seen:
+                coords = seen[parcel_id]
+            else:
+                if i > 0:
+                    time.sleep(REQUEST_DELAY)
+                coords = geocode_parcel(parcel_id)
+                seen[parcel_id] = coords
+
+            if coords:
+                update_geocoding(conn, row["document_number"], coords[0], coords[1])
+                geocoded_count += 1
+                logger.info(f"[{i+1}/{len(ungeocoded)}] {parcel_id} -> ({coords[0]}, {coords[1]})")
+            else:
+                logger.warning(f"[{i+1}/{len(ungeocoded)}] {parcel_id} -> FAILED")
+
+        print(f"Geocoded {geocoded_count}/{len(ungeocoded)} new parcels")
+
+    # Re-read all rows (now with updated geocoding)
+    rows = get_all(conn)
+    conn.close()
+
+    # Convert to the format build_output expects
+    records = []
+    for row in rows:
+        records.append({
+            "document_number": row["document_number"] or "",
+            "case_number": row["case_number"] or "",
+            "case_type": row["case_type"] or "",
+            "recorded_date": row["recorded_date"] or "",
+            "party2": row["party2"] or "",
+            "parcel_id": row["parcel_id"] or "",
+            "subdivision": row["subdivision"] or "",
+            "lat": row["lat"],
+            "lng": row["lng"],
+            # Assessor enrichment fields
+            "owner_name": row["owner_name"] or "",
+            "property_address": row["property_address"] or "",
+            "mailing_address": row["mailing_address"] or "",
+            "absentee_owner": bool(row["absentee_owner"]) if row["absentee_owner"] is not None else False,
+            "assessed_value": row["assessed_value"],
+            "net_taxable_value": row["net_taxable_value"],
+            "tax_status": row["tax_status"] or "",
+            "property_class": row["property_class"] or "",
+            "acres": row["acres"],
+        })
+
+    return records
+
+
 # ---------------------------------------------------------------------------
 # Geocoding
 # ---------------------------------------------------------------------------
@@ -251,7 +319,7 @@ def build_output(records: list[dict]) -> dict:
 
     features = []
     for r in records:
-        features.append({
+        feature = {
             "document_number": r["document_number"],
             "case_number": r["case_number"],
             "case_type": r["case_type"],
@@ -261,7 +329,14 @@ def build_output(records: list[dict]) -> dict:
             "subdivision": r.get("subdivision", ""),
             "lat": r.get("lat"),
             "lng": r.get("lng"),
-        })
+        }
+        # Include assessor fields if present
+        for field in ("owner_name", "property_address", "mailing_address",
+                      "absentee_owner", "assessed_value", "net_taxable_value",
+                      "tax_status", "property_class", "acres"):
+            if field in r:
+                feature[field] = r[field]
+        features.append(feature)
 
     return {
         "generated_at": datetime.now().isoformat(timespec="seconds"),
@@ -300,6 +375,10 @@ def main():
         help=f"Output JSON path (default: {DEFAULT_OUTPUT})"
     )
     parser.add_argument(
+        "--db", type=str, default=None,
+        help="SQLite database path. When provided, reads from DB instead of CSV."
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging"
     )
@@ -311,22 +390,33 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    csv_path = Path(args.input) if args.input else DEFAULT_CSV
     output_path = Path(args.output) if args.output else DEFAULT_OUTPUT
 
-    if not csv_path.exists():
-        print(f"ERROR: CSV not found: {csv_path}")
-        sys.exit(1)
+    if args.db:
+        db_path = Path(args.db)
+        if not db_path.exists():
+            print(f"ERROR: Database not found: {db_path}")
+            sys.exit(1)
+        print(f"Reading from database {db_path}...")
+        records = read_db(db_path)
+    else:
+        csv_path = Path(args.input) if args.input else DEFAULT_CSV
+        if not csv_path.exists():
+            print(f"ERROR: CSV not found: {csv_path}")
+            sys.exit(1)
+        print(f"Reading {csv_path}...")
+        records = read_csv(csv_path)
 
-    print(f"Reading {csv_path}...")
-    records = read_csv(csv_path)
+        if not records:
+            print("No records found in CSV.")
+            sys.exit(0)
+
+        print(f"Geocoding {len(records)} parcels via ArcGIS...")
+        records = geocode_records(records)
 
     if not records:
-        print("No records found in CSV.")
+        print("No records found.")
         sys.exit(0)
-
-    print(f"Geocoding {len(records)} parcels via ArcGIS...")
-    records = geocode_records(records)
 
     data = build_output(records)
     write_output(data, output_path)
