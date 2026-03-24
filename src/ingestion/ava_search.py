@@ -35,6 +35,8 @@ from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+from src.utils.parsing import parse_legals
+
 try:
     from playwright.async_api import async_playwright, Page, Response
 
@@ -526,6 +528,27 @@ def export_to_csv(records: list[LisPendensRecord], output_path: str | Path) -> P
     return output_path
 
 
+def records_to_db(records: list[LisPendensRecord], db_path: str | Path) -> int:
+    """Write LisPendensRecord objects to the SQLite database."""
+    from src.db.database import get_db, upsert_records
+
+    conn = get_db(db_path)
+    db_records = []
+    for r in records:
+        d = r.to_dict()
+        # Parse legals into parcel_id and subdivision
+        parcel_ids, subdivisions = parse_legals(d.get("legals", ""))
+        d["parcel_id"] = parcel_ids[0] if parcel_ids else ""
+        d["subdivision"] = subdivisions[0] if subdivisions else ""
+        d["legals_raw"] = d.pop("legals", "")
+        db_records.append(d)
+
+    count = upsert_records(conn, db_records)
+    conn.close()
+    logger.info(f"Upserted {count} records to {db_path}")
+    return count
+
+
 # ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
@@ -561,6 +584,10 @@ async def main():
     parser.add_argument(
         "--json", action="store_true",
         help="Print results as JSON to stdout"
+    )
+    parser.add_argument(
+        "--db", type=str, default=None,
+        help="SQLite database path. When provided, writes records to DB."
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -627,6 +654,11 @@ async def main():
         output_path = args.output or f"lis_pendens_{datetime.now():%Y-%m-%d}.csv"
         export_to_csv(records, output_path)
         print(f"\nSaved to: {output_path}")
+
+    # DB export
+    if args.db:
+        count = records_to_db(records, args.db)
+        print(f"Wrote {count} records to DB: {args.db}")
 
 
 if __name__ == "__main__":
