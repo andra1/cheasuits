@@ -151,6 +151,20 @@ def get_db(db_path: str | Path) -> sqlite3.Connection:
     conn.execute("CREATE INDEX IF NOT EXISTS idx_valued_at ON properties(valued_at)")
     conn.commit()
 
+    # Migrate: add census tract columns to properties and delinquent_taxes
+    _TRACT_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN census_tract TEXT",
+        "ALTER TABLE properties ADD COLUMN tract_enriched_at TEXT",
+        "ALTER TABLE delinquent_taxes ADD COLUMN census_tract TEXT",
+        "ALTER TABLE delinquent_taxes ADD COLUMN tract_enriched_at TEXT",
+    ]
+    for stmt in _TRACT_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
     return conn
 
 

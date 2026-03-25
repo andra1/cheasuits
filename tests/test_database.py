@@ -277,3 +277,17 @@ class TestUspsVacancyTable:
         summary = get_vacancy_summary(db, state_fips="17")
         assert len(summary) >= 1
         assert summary[0]["geoid"] == "17163000100"
+
+
+class TestCensusTractMigration:
+    def test_properties_has_census_tract_column(self, db):
+        cursor = db.execute("PRAGMA table_info(properties)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "census_tract" in columns
+        assert "tract_enriched_at" in columns
+
+    def test_delinquent_has_census_tract_column(self, db):
+        cursor = db.execute("PRAGMA table_info(delinquent_taxes)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "census_tract" in columns
+        assert "tract_enriched_at" in columns
