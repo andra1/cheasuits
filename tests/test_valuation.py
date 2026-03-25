@@ -9,6 +9,7 @@ from src.enrichment.valuation import (
     compute_assessed_multiplier,
     blend_estimates,
     fetch_redfin_estimate,
+    fetch_zillow_estimate,
 )
 
 
@@ -118,4 +119,56 @@ class TestFetchRedfinEstimate:
             "http://example.com", 403, "Forbidden", {}, None
         )
         result = fetch_redfin_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result is None
+
+
+class TestFetchZillowEstimate:
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_extracts_zestimate_from_json_ld(self, mock_urlopen):
+        page_html = b"""<html><body>
+        <script type="application/json" id="__NEXT_DATA__">
+        {"props":{"pageProps":{"componentProps":{"gdpClientCache":{"\\"zpid\\"123":{"property":{"zestimate":145000}}}}}}}
+        </script>
+        </body></html>"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = page_html
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        result = fetch_zillow_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result == 145000.0
+
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_extracts_zestimate_from_regex_fallback(self, mock_urlopen):
+        page_html = b"""<html><body>
+        <script>"zestimate":98500,"zestimateLowPercent"</script>
+        </body></html>"""
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = page_html
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        result = fetch_zillow_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result == 98500.0
+
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_returns_none_on_http_error(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "http://example.com", 403, "Forbidden", {}, None
+        )
+        result = fetch_zillow_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result is None
+
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_returns_none_on_no_estimate(self, mock_urlopen):
+        page_html = b"<html><body>No data here</body></html>"
+        mock_resp = MagicMock()
+        mock_resp.read.return_value = page_html
+        mock_resp.__enter__ = lambda s: s
+        mock_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = mock_resp
+
+        result = fetch_zillow_estimate("209 Edwards St, Cahokia, IL 62206")
         assert result is None

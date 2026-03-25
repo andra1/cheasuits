@@ -212,3 +212,72 @@ def fetch_redfin_estimate(address: str) -> Optional[float]:
 
     logger.debug(f"Redfin: no estimate found for {normalized}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Zillow Scraper
+# ---------------------------------------------------------------------------
+
+def fetch_zillow_estimate(address: str) -> Optional[float]:
+    """Fetch Zillow Zestimate for a property address.
+
+    1. Construct search URL from address
+    2. Fetch page
+    3. Extract Zestimate from __NEXT_DATA__ JSON or regex fallback
+
+    Returns estimated value or None if unavailable.
+    """
+    normalized = _normalize_address(address)
+
+    # Format address for Zillow URL: "209 Edwards St, Cahokia, IL 62206" -> "209-Edwards-St,-Cahokia,-IL-62206"
+    slug = re.sub(r'[^\w,\s-]', '', normalized)
+    slug = re.sub(r'[\s]+', '-', slug.strip())
+    url = f"https://www.zillow.com/homes/{slug}_rb/"
+
+    try:
+        req = urllib.request.Request(url, headers={
+            "User-Agent": _get_user_agent(),
+            "Accept": "text/html,application/xhtml+xml",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8")
+
+    except Exception as e:
+        logger.warning(f"Zillow fetch failed for {normalized}: {e}")
+        return None
+
+    # Try __NEXT_DATA__ JSON blob
+    try:
+        match = re.search(
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+            html, re.DOTALL,
+        )
+        if match:
+            page_data = json.loads(match.group(1))
+            # Navigate the nested gdpClientCache structure
+            gdp_cache = (
+                page_data.get("props", {})
+                .get("pageProps", {})
+                .get("componentProps", {})
+                .get("gdpClientCache", {})
+            )
+            for cache_val in gdp_cache.values():
+                if isinstance(cache_val, dict):
+                    zest = cache_val.get("property", {}).get("zestimate")
+                    if zest and isinstance(zest, (int, float)) and zest > 0:
+                        logger.info(f"Zillow Zestimate for {normalized}: ${zest:,.0f}")
+                        return float(zest)
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.debug(f"Zillow JSON parse failed for {normalized}: {e}")
+
+    # Regex fallback: find "zestimate":NNNNN in page content
+    zest_match = re.search(r'"zestimate"\s*:\s*(\d+)', html)
+    if zest_match:
+        value = float(zest_match.group(1))
+        if value > 0:
+            logger.info(f"Zillow Zestimate (regex) for {normalized}: ${value:,.0f}")
+            return value
+
+    logger.debug(f"Zillow: no Zestimate found for {normalized}")
+    return None
