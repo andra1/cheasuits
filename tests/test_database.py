@@ -20,6 +20,10 @@ from src.db.database import (
     upsert_vacancy_records,
     get_vacancy_by_tract,
     get_vacancy_summary,
+    get_untracted_properties,
+    update_property_tract,
+    get_untracted_delinquent,
+    update_delinquent_tract,
 )
 
 
@@ -291,3 +295,48 @@ class TestCensusTractMigration:
         columns = [row[1] for row in cursor.fetchall()]
         assert "census_tract" in columns
         assert "tract_enriched_at" in columns
+
+
+class TestCensusTractHelpers:
+    def test_get_untracted_properties(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_geocoding(db, "2224358", 38.567, -90.123)
+        rows = get_untracted_properties(db)
+        assert len(rows) == 1
+        assert rows[0]["lat"] == 38.567
+
+    def test_get_untracted_excludes_already_tracted(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_geocoding(db, "2224358", 38.567, -90.123)
+        update_property_tract(db, "2224358", "17163000100")
+        rows = get_untracted_properties(db)
+        assert len(rows) == 0
+
+    def test_get_untracted_excludes_ungeocoded(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        rows = get_untracted_properties(db)
+        assert len(rows) == 0
+
+    def test_update_property_tract(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_property_tract(db, "2224358", "17163000100")
+        rows = get_all(db)
+        assert rows[0]["census_tract"] == "17163000100"
+        assert rows[0]["tract_enriched_at"] is not None
+
+    def test_update_delinquent_tract(self, db):
+        from src.db.database import upsert_delinquent_taxes
+        dt_record = {
+            "parcel_id": "01350402022",
+            "publication_year": 2026,
+            "street": "209 EDWARDS ST",
+            "city": "CAHOKIA",
+            "source_file": "test.pdf",
+            "scraped_at": "2026-03-25T10:00:00",
+        }
+        upsert_delinquent_taxes(db, [dt_record])
+        row = db.execute("SELECT id FROM delinquent_taxes LIMIT 1").fetchone()
+        update_delinquent_tract(db, row[0], "17163000100")
+        rows = db.execute("SELECT * FROM delinquent_taxes WHERE id = ?", (row[0],)).fetchall()
+        assert dict(rows[0])["census_tract"] == "17163000100"
+        assert dict(rows[0])["tract_enriched_at"] is not None

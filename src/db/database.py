@@ -502,3 +502,49 @@ def get_vacancy_summary(
         params,
     )
     return [dict(row) for row in cursor.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# Census tract enrichment helpers
+# ---------------------------------------------------------------------------
+
+def get_untracted_properties(conn: sqlite3.Connection) -> list[dict]:
+    """Get properties that have lat/lng but no census_tract yet."""
+    cursor = conn.execute(
+        "SELECT * FROM properties "
+        "WHERE lat IS NOT NULL AND lng IS NOT NULL AND census_tract IS NULL"
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_property_tract(
+    conn: sqlite3.Connection, document_number: str, census_tract: str
+) -> None:
+    """Set census_tract and tract_enriched_at on a properties row."""
+    conn.execute(
+        "UPDATE properties SET census_tract = ?, tract_enriched_at = ? "
+        "WHERE document_number = ?",
+        (census_tract, datetime.now().isoformat(timespec="seconds"), document_number),
+    )
+    conn.commit()
+
+
+def get_untracted_delinquent(conn: sqlite3.Connection) -> list[dict]:
+    """Get delinquent_taxes rows that have lat/lng but no census_tract yet."""
+    cursor = conn.execute(
+        "SELECT * FROM delinquent_taxes "
+        "WHERE lat IS NOT NULL AND lng IS NOT NULL AND census_tract IS NULL"
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_delinquent_tract(
+    conn: sqlite3.Connection, row_id: int, census_tract: str
+) -> None:
+    """Set census_tract and tract_enriched_at on a delinquent_taxes row."""
+    conn.execute(
+        "UPDATE delinquent_taxes SET census_tract = ?, tract_enriched_at = ? "
+        "WHERE id = ?",
+        (census_tract, datetime.now().isoformat(timespec="seconds"), row_id),
+    )
+    conn.commit()
