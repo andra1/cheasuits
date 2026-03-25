@@ -17,6 +17,13 @@ from src.db.database import (
     get_unvalued,
     update_valuation,
     set_valuation_error,
+    upsert_vacancy_records,
+    get_vacancy_by_tract,
+    get_vacancy_summary,
+    get_untracted_properties,
+    update_property_tract,
+    get_untracted_delinquent,
+    update_delinquent_tract,
 )
 
 
@@ -214,3 +221,122 @@ class TestUpdateValuation:
         assert row["valuation_source"] == "zillow"
         assert row["valuation_confidence"] == "high"
         assert row["valued_at"] is not None
+
+
+SAMPLE_VACANCY = {
+    "geoid": "17163000100",
+    "state_fips": "17",
+    "county_fips": "163",
+    "tract_code": "000100",
+    "year": 2025,
+    "quarter": 1,
+    "total_residential": 500,
+    "vacant_residential": 25,
+    "vacancy_rate_residential": 5.0,
+    "no_stat_residential": 10,
+    "total_business": 50,
+    "vacant_business": 5,
+    "vacancy_rate_business": 10.0,
+    "no_stat_business": 2,
+    "scraped_at": "2026-03-25T10:00:00",
+}
+
+
+class TestUspsVacancyTable:
+    def test_table_created(self, db):
+        cursor = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='usps_vacancy'"
+        )
+        assert cursor.fetchone() is not None
+
+    def test_upsert_insert(self, db):
+        count = upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        assert count == 1
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 1
+        assert rows[0]["total_residential"] == 500
+        assert rows[0]["vacant_residential"] == 25
+
+    def test_upsert_updates_on_conflict(self, db):
+        upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        updated = {**SAMPLE_VACANCY, "vacant_residential": 30, "vacancy_rate_residential": 6.0}
+        upsert_vacancy_records(db, [updated])
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 1
+        assert rows[0]["vacant_residential"] == 30
+
+    def test_upsert_empty_list(self, db):
+        count = upsert_vacancy_records(db, [])
+        assert count == 0
+
+    def test_get_vacancy_by_tract(self, db):
+        rec_q1 = {**SAMPLE_VACANCY}
+        rec_q2 = {**SAMPLE_VACANCY, "quarter": 2, "vacant_residential": 30}
+        upsert_vacancy_records(db, [rec_q1, rec_q2])
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 2
+
+    def test_get_vacancy_summary(self, db):
+        upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        summary = get_vacancy_summary(db, state_fips="17")
+        assert len(summary) >= 1
+        assert summary[0]["geoid"] == "17163000100"
+
+
+class TestCensusTractMigration:
+    def test_properties_has_census_tract_column(self, db):
+        cursor = db.execute("PRAGMA table_info(properties)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "census_tract" in columns
+        assert "tract_enriched_at" in columns
+
+    def test_delinquent_has_census_tract_column(self, db):
+        cursor = db.execute("PRAGMA table_info(delinquent_taxes)")
+        columns = [row[1] for row in cursor.fetchall()]
+        assert "census_tract" in columns
+        assert "tract_enriched_at" in columns
+
+
+class TestCensusTractHelpers:
+    def test_get_untracted_properties(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_geocoding(db, "2224358", 38.567, -90.123)
+        rows = get_untracted_properties(db)
+        assert len(rows) == 1
+        assert rows[0]["lat"] == 38.567
+
+    def test_get_untracted_excludes_already_tracted(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_geocoding(db, "2224358", 38.567, -90.123)
+        update_property_tract(db, "2224358", "17163000100")
+        rows = get_untracted_properties(db)
+        assert len(rows) == 0
+
+    def test_get_untracted_excludes_ungeocoded(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        rows = get_untracted_properties(db)
+        assert len(rows) == 0
+
+    def test_update_property_tract(self, db):
+        upsert_records(db, [SAMPLE_RECORD])
+        update_property_tract(db, "2224358", "17163000100")
+        rows = get_all(db)
+        assert rows[0]["census_tract"] == "17163000100"
+        assert rows[0]["tract_enriched_at"] is not None
+
+    def test_update_delinquent_tract(self, db):
+        from src.db.database import upsert_delinquent_taxes
+        dt_record = {
+            "parcel_id": "01350402022",
+            "publication_year": 2026,
+            "street": "209 EDWARDS ST",
+            "city": "CAHOKIA",
+            "source_file": "test.pdf",
+            "scraped_at": "2026-03-25T10:00:00",
+        }
+        upsert_delinquent_taxes(db, [dt_record])
+        row = db.execute("SELECT id FROM delinquent_taxes LIMIT 1").fetchone()
+        update_delinquent_tract(db, row[0], "17163000100")
+        rows = db.execute("SELECT * FROM delinquent_taxes WHERE id = ?", (row[0],)).fetchall()
+        assert dict(rows[0])["census_tract"] == "17163000100"
+        assert dict(rows[0])["tract_enriched_at"] is not None
