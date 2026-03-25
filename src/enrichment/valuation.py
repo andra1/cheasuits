@@ -281,3 +281,114 @@ def fetch_zillow_estimate(address: str) -> Optional[float]:
 
     logger.debug(f"Zillow: no Zestimate found for {normalized}")
     return None
+
+
+# ---------------------------------------------------------------------------
+# Enrichment Orchestrator
+# ---------------------------------------------------------------------------
+
+def enrich_valuations_from_db(db_path: Path) -> None:
+    """Fetch valuations for all unvalued properties in the database."""
+    from src.db.database import (
+        get_db, get_unvalued, update_valuation, set_valuation_error,
+    )
+
+    conn = get_db(db_path)
+    rows = get_unvalued(conn)
+
+    if not rows:
+        print("No unvalued properties found.")
+        conn.close()
+        return
+
+    print(f"Valuing {len(rows)} properties...")
+
+    valued = 0
+    failed = 0
+    request_count = 0
+
+    for i, row in enumerate(rows):
+        doc_num = row["document_number"]
+        assessed_value = row["assessed_value"]
+        address = row.get("property_address", "")
+
+        # Step 1: Assessed multiplier (always available)
+        assessed_mult = compute_assessed_multiplier(
+            assessed_value, STCLAIR_STATE_MULTIPLIER
+        )
+
+        # Step 2: Try external estimates (only if address available)
+        redfin_est = None
+        zillow_est = None
+
+        if address:
+            normalized_addr = _normalize_address(address)
+
+            # Try Redfin
+            if request_count > 0:
+                time.sleep(SCRAPE_DELAY)
+            redfin_est = fetch_redfin_estimate(normalized_addr)
+            request_count += 1
+
+            # Always try Zillow too (enables "blended" when both succeed)
+            time.sleep(SCRAPE_DELAY)
+            zillow_est = fetch_zillow_estimate(normalized_addr)
+            request_count += 1
+
+        # Step 3: Blend
+        est_value, source, confidence = blend_estimates(
+            assessed_mult, zillow_est, redfin_est
+        )
+
+        if est_value <= 0:
+            set_valuation_error(conn, doc_num, "all methods returned zero or negative")
+            failed += 1
+            logger.warning(f"[{i+1}/{len(rows)}] {doc_num} -> FAILED (zero value)")
+            continue
+
+        fields = {
+            "assessed_multiplier_value": assessed_mult,
+            "estimated_market_value": est_value,
+            "valuation_source": source,
+            "valuation_confidence": confidence,
+        }
+        if zillow_est is not None:
+            fields["zillow_estimate"] = zillow_est
+        if redfin_est is not None:
+            fields["redfin_estimate"] = redfin_est
+
+        update_valuation(conn, doc_num, fields)
+        valued += 1
+        logger.info(
+            f"[{i+1}/{len(rows)}] {doc_num} -> ${est_value:,.0f} "
+            f"({source}, {confidence})"
+        )
+
+    conn.close()
+    print(f"\nValued {valued}/{len(rows)} properties ({failed} failed)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Estimate market values for properties in the pipeline DB"
+    )
+    parser.add_argument(
+        "--db", type=str, default=str(DEFAULT_DB),
+        help=f"Database path (default: {DEFAULT_DB})",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose logging",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    enrich_valuations_from_db(Path(args.db))
+
+
+if __name__ == "__main__":
+    main()

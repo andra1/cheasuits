@@ -172,3 +172,75 @@ class TestFetchZillowEstimate:
 
         result = fetch_zillow_estimate("209 Edwards St, Cahokia, IL 62206")
         assert result is None
+
+
+from src.enrichment.valuation import enrich_valuations_from_db
+from src.db.database import (
+    get_db, upsert_records, update_enrichment, get_all,
+)
+
+
+SAMPLE_RECORD = {
+    "document_number": "2224358",
+    "case_number": "26-FC-121",
+    "case_type": "FC",
+    "case_year": "2026",
+    "recorded_date": "2026-03-23",
+    "party1": "",
+    "party2": "ALLEN RUTH",
+    "parcel_id": "01-35-0-402-022",
+    "subdivision": "EDWARD PLACE L: 28",
+    "legals_raw": "",
+    "source": "ava_search_stclair",
+    "scraped_at": "2026-03-23T20:19:53",
+}
+
+
+class TestEnrichValuationsFromDb:
+    @patch("src.enrichment.valuation.fetch_redfin_estimate", return_value=None)
+    @patch("src.enrichment.valuation.fetch_zillow_estimate", return_value=None)
+    def test_assessed_multiplier_fallback(self, mock_zillow, mock_redfin, tmp_path):
+        db_path = tmp_path / "test.db"
+        conn = get_db(db_path)
+        upsert_records(conn, [SAMPLE_RECORD])
+        update_enrichment(conn, "2224358", {
+            "assessed_value": 12952.0,
+            "property_address": "209 Edwards St\nCahokia, IL 62206",
+        })
+        conn.close()
+
+        enrich_valuations_from_db(db_path)
+
+        conn = get_db(db_path)
+        rows = get_all(conn)
+        conn.close()
+
+        row = rows[0]
+        assert row["estimated_market_value"] is not None
+        assert row["estimated_market_value"] > 0
+        assert row["valuation_source"] == "assessed_multiplier"
+        assert row["valuation_confidence"] == "medium"
+        assert row["valued_at"] is not None
+
+    @patch("src.enrichment.valuation.fetch_redfin_estimate", return_value=42000.0)
+    @patch("src.enrichment.valuation.fetch_zillow_estimate", return_value=None)
+    def test_uses_redfin_when_available(self, mock_zillow, mock_redfin, tmp_path):
+        db_path = tmp_path / "test.db"
+        conn = get_db(db_path)
+        upsert_records(conn, [SAMPLE_RECORD])
+        update_enrichment(conn, "2224358", {
+            "assessed_value": 12952.0,
+            "property_address": "209 Edwards St\nCahokia, IL 62206",
+        })
+        conn.close()
+
+        enrich_valuations_from_db(db_path)
+
+        conn = get_db(db_path)
+        rows = get_all(conn)
+        conn.close()
+
+        row = rows[0]
+        assert row["estimated_market_value"] == 42000.0
+        assert row["valuation_source"] == "redfin"
+        assert row["redfin_estimate"] == 42000.0
