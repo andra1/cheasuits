@@ -143,6 +143,10 @@ def read_db(db_path: Path) -> list[dict]:
             "valuation_source": row["valuation_source"] or "",
             "valuation_confidence": row["valuation_confidence"] or "",
             "valued_at": row["valued_at"] or "",
+            # Comps fields
+            "comps_estimate": row.get("comps_estimate"),
+            "comps_count": row.get("comps_count"),
+            "comps_confidence": row.get("comps_confidence") or "",
         })
 
     return records
@@ -343,7 +347,8 @@ def build_output(records: list[dict]) -> dict:
                       "tax_rate", "total_tax",
                       "tax_status", "property_class", "acres",
                       "estimated_market_value", "valuation_source",
-                      "valuation_confidence", "valued_at"):
+                      "valuation_confidence", "valued_at",
+                      "comps_estimate", "comps_count", "comps_confidence"):
             if field in r:
                 feature[field] = r[field]
         features.append(feature)

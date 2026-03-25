@@ -109,6 +109,23 @@ CREATE TABLE IF NOT EXISTS usps_vacancy (
 CREATE INDEX IF NOT EXISTS idx_vac_geoid ON usps_vacancy(geoid);
 CREATE INDEX IF NOT EXISTS idx_vac_state ON usps_vacancy(state_fips);
 CREATE INDEX IF NOT EXISTS idx_vac_year_qtr ON usps_vacancy(year, quarter);
+
+CREATE TABLE IF NOT EXISTS comparable_sales (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    address TEXT NOT NULL,
+    lat REAL, lng REAL,
+    sale_price REAL NOT NULL,
+    sale_date TEXT NOT NULL,
+    property_type TEXT DEFAULT '',
+    sqft REAL, beds INTEGER, baths REAL,
+    lot_size REAL, year_built INTEGER,
+    source TEXT NOT NULL,
+    source_id TEXT DEFAULT '',
+    scraped_at TEXT DEFAULT '',
+    UNIQUE(address, sale_date, source)
+);
+CREATE INDEX IF NOT EXISTS idx_comp_lat_lng ON comparable_sales(lat, lng);
+CREATE INDEX IF NOT EXISTS idx_comp_sale_date ON comparable_sales(sale_date);
 """
 
 INGESTION_COLUMNS = [
@@ -159,6 +176,20 @@ def get_db(db_path: str | Path) -> sqlite3.Connection:
         "ALTER TABLE delinquent_taxes ADD COLUMN tract_enriched_at TEXT",
     ]
     for stmt in _TRACT_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+    # Migrate: add comps valuation columns to properties
+    _COMPS_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN comps_estimate REAL",
+        "ALTER TABLE properties ADD COLUMN comps_count INTEGER",
+        "ALTER TABLE properties ADD COLUMN comps_confidence TEXT",
+        "ALTER TABLE properties ADD COLUMN comps_updated_at TEXT",
+    ]
+    for stmt in _COMPS_MIGRATIONS:
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
@@ -273,7 +304,8 @@ def update_valuation(
     """Update valuation fields and set valued_at timestamp."""
     allowed = {
         "assessed_multiplier_value", "zillow_estimate", "redfin_estimate",
-        "estimated_market_value", "valuation_source", "valuation_confidence",
+        "comps_estimate", "estimated_market_value", "valuation_source",
+        "valuation_confidence",
     }
     filtered = {k: v for k, v in fields.items() if k in allowed}
     filtered["valued_at"] = datetime.now().isoformat(timespec="seconds")
@@ -546,5 +578,99 @@ def update_delinquent_tract(
         "UPDATE delinquent_taxes SET census_tract = ?, tract_enriched_at = ? "
         "WHERE id = ?",
         (census_tract, datetime.now().isoformat(timespec="seconds"), row_id),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Comparable sales table helpers
+# ---------------------------------------------------------------------------
+
+def upsert_comparable_sales(conn: sqlite3.Connection, records: list[dict]) -> int:
+    """Insert or update comparable sale records.
+
+    Keyed on (address, sale_date, source). Returns number of records upserted.
+    """
+    if not records:
+        return 0
+
+    cols = [
+        "lat", "lng", "sale_price", "property_type", "sqft", "beds", "baths",
+        "lot_size", "year_built", "source", "source_id", "scraped_at",
+    ]
+    update_clause = ", ".join(f"{col} = excluded.{col}" for col in cols)
+
+    sql = f"""
+        INSERT INTO comparable_sales (address, sale_date, {", ".join(cols)})
+        VALUES (:address, :sale_date, {", ".join(":" + c for c in cols)})
+        ON CONFLICT(address, sale_date, source) DO UPDATE SET {update_clause}
+    """
+
+    count = 0
+    for record in records:
+        params = {
+            "address": record["address"],
+            "sale_date": record["sale_date"],
+        }
+        for col in cols:
+            params[col] = record.get(col)
+        conn.execute(sql, params)
+        count += 1
+
+    conn.commit()
+    return count
+
+
+def get_comps_near(
+    conn: sqlite3.Connection,
+    lat: float,
+    lng: float,
+    radius_miles: float = 1.5,
+    months_back: int = 6,
+) -> list[dict]:
+    """Get comparable sales within a bounding box, filtered by date.
+
+    Uses a lat/lng bounding box as a SQL pre-filter, then applies Haversine
+    post-filter in Python for accurate distance.
+    """
+    import math
+
+    # Bounding box: ~1 degree lat ≈ 69 miles, ~1 degree lng ≈ 69 * cos(lat) miles
+    lat_delta = radius_miles / 69.0
+    lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
+
+    min_lat = lat - lat_delta
+    max_lat = lat + lat_delta
+    min_lng = lng - lng_delta
+    max_lng = lng + lng_delta
+
+    cursor = conn.execute(
+        """
+        SELECT * FROM comparable_sales
+        WHERE lat BETWEEN ? AND ?
+          AND lng BETWEEN ? AND ?
+          AND sale_date >= date('now', ?)
+          AND sale_price > 0
+        ORDER BY sale_date DESC
+        """,
+        (min_lat, max_lat, min_lng, max_lng, f"-{months_back} months"),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_comps_valuation(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """Write comps_estimate, comps_count, comps_confidence to a property row."""
+    allowed = {"comps_estimate", "comps_count", "comps_confidence"}
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    filtered["comps_updated_at"] = datetime.now().isoformat(timespec="seconds")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
+    filtered["document_number"] = document_number
+
+    conn.execute(
+        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
+        filtered,
     )
     conn.commit()

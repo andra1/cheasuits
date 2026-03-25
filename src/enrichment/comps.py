@@ -1,0 +1,292 @@
+"""Comparable Sales Matching & Estimation Engine.
+
+Queries the comparable_sales table for nearby recent sales, scores and ranks
+them against a subject property, and produces a comps-based value estimate.
+
+Usage:
+    python -m src.enrichment.comps [--db data/cheasuits.db] [--radius 1.5] [--months 6] [-v]
+"""
+
+from __future__ import annotations
+
+import argparse
+import logging
+import math
+from pathlib import Path
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_DB = Path(__file__).resolve().parent.parent.parent / "data" / "cheasuits.db"
+
+# Scoring weights for comp selection
+WEIGHT_DISTANCE = 0.4
+WEIGHT_RECENCY = 0.3
+WEIGHT_LOT_SIZE = 0.3
+
+# Maximum number of comps to use for estimation
+MAX_COMPS = 10
+
+
+# ---------------------------------------------------------------------------
+# Geometry helpers
+# ---------------------------------------------------------------------------
+
+def haversine_distance(lat1: float, lng1: float, lat2: float, lng2: float) -> float:
+    """Compute distance in miles between two lat/lng points using Haversine formula."""
+    R = 3958.8  # Earth radius in miles
+
+    lat1_r, lat2_r = math.radians(lat1), math.radians(lat2)
+    dlat = math.radians(lat2 - lat1)
+    dlng = math.radians(lng2 - lng1)
+
+    a = math.sin(dlat / 2) ** 2 + math.cos(lat1_r) * math.cos(lat2_r) * math.sin(dlng / 2) ** 2
+    c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a))
+
+    return R * c
+
+
+def bounding_box(lat: float, lng: float, radius_miles: float) -> tuple:
+    """Compute lat/lng bounding box for SQL pre-filter.
+
+    Returns (min_lat, max_lat, min_lng, max_lng).
+    """
+    lat_delta = radius_miles / 69.0
+    lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
+
+    return (
+        lat - lat_delta,
+        lat + lat_delta,
+        lng - lng_delta,
+        lng + lng_delta,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Comp finding and scoring
+# ---------------------------------------------------------------------------
+
+def _score_comp(subject: dict, comp: dict) -> float:
+    """Score a comparable sale against the subject property (0-1, higher=better).
+
+    Factors: proximity (closer=better), recency (newer=better), lot size similarity.
+    """
+    # Distance score: 0 at max_dist, 1 at 0 distance
+    dist = comp.get("_distance", 0)
+    max_dist = 1.5  # miles
+    dist_score = max(0, 1.0 - dist / max_dist)
+
+    # Recency score: based on days since sale (0 at 180 days, 1 at 0 days)
+    from datetime import datetime, date
+    try:
+        sale_date = datetime.strptime(comp["sale_date"], "%Y-%m-%d").date()
+        days_ago = (date.today() - sale_date).days
+    except (ValueError, KeyError):
+        days_ago = 180
+    recency_score = max(0, 1.0 - days_ago / 180)
+
+    # Lot size similarity: 1 if identical, decays with divergence
+    subject_lot = subject.get("acres") or subject.get("lot_size")
+    comp_lot = comp.get("lot_size")
+    if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
+        ratio = min(subject_lot, comp_lot) / max(subject_lot, comp_lot)
+        lot_score = ratio
+    else:
+        lot_score = 0.5  # neutral if data missing
+
+    return (
+        WEIGHT_DISTANCE * dist_score
+        + WEIGHT_RECENCY * recency_score
+        + WEIGHT_LOT_SIZE * lot_score
+    )
+
+
+def find_comps(
+    conn,
+    subject: dict,
+    radius_miles: float = 1.5,
+    months_back: int = 6,
+) -> list[dict]:
+    """Find comparable sales for a subject property.
+
+    Returns comps sorted by score (best first), with _distance and _score added.
+    """
+    from src.db.database import get_comps_near
+
+    lat = subject.get("lat")
+    lng = subject.get("lng")
+    if lat is None or lng is None:
+        return []
+
+    candidates = get_comps_near(conn, lat, lng, radius_miles, months_back)
+
+    # Post-filter with exact Haversine distance
+    comps = []
+    for c in candidates:
+        if c.get("lat") is None or c.get("lng") is None:
+            continue
+        dist = haversine_distance(lat, lng, c["lat"], c["lng"])
+        if dist <= radius_miles:
+            c["_distance"] = round(dist, 3)
+            c["_score"] = round(_score_comp(subject, c), 3)
+            comps.append(c)
+
+    # Sort by score descending
+    comps.sort(key=lambda x: x["_score"], reverse=True)
+    return comps[:MAX_COMPS]
+
+
+# ---------------------------------------------------------------------------
+# Estimation
+# ---------------------------------------------------------------------------
+
+def estimate_from_comps(
+    subject: dict,
+    comps: list[dict],
+) -> tuple[float | None, int, str]:
+    """Estimate value from comparable sales using distance-weighted average.
+
+    Returns (estimated_value, comp_count, confidence).
+    Confidence: "high" (3+), "medium" (2), "low" (1), None (0).
+    """
+    if not comps:
+        return (None, 0, "")
+
+    # Distance-weighted average of sale prices, with lot size adjustment
+    subject_lot = subject.get("acres") or subject.get("lot_size")
+    total_weight = 0.0
+    weighted_sum = 0.0
+
+    for c in comps:
+        price = c["sale_price"]
+
+        # Lot size adjustment: scale price by lot size ratio if both available
+        comp_lot = c.get("lot_size")
+        if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
+            lot_ratio = subject_lot / comp_lot
+            # Clamp adjustment to avoid extreme distortions
+            lot_ratio = max(0.5, min(2.0, lot_ratio))
+            price = price * lot_ratio
+
+        # Weight by score (which already factors in distance, recency, lot similarity)
+        weight = c.get("_score", 0.5)
+        weighted_sum += price * weight
+        total_weight += weight
+
+    if total_weight == 0:
+        return (None, 0, "")
+
+    estimate = round(weighted_sum / total_weight, 2)
+    count = len(comps)
+
+    if count >= 3:
+        confidence = "high"
+    elif count == 2:
+        confidence = "medium"
+    else:
+        confidence = "low"
+
+    return (estimate, count, confidence)
+
+
+# ---------------------------------------------------------------------------
+# Orchestrator
+# ---------------------------------------------------------------------------
+
+def enrich_comps_from_db(
+    db_path: Path,
+    radius_miles: float = 1.5,
+    months_back: int = 6,
+) -> None:
+    """Loop over properties with lat/lng, find comps, write estimates."""
+    from src.db.database import get_db, update_comps_valuation
+
+    conn = get_db(db_path)
+
+    # Get properties that have coordinates
+    cursor = conn.execute(
+        "SELECT * FROM properties WHERE lat IS NOT NULL AND lng IS NOT NULL"
+    )
+    rows = [dict(row) for row in cursor.fetchall()]
+
+    if not rows:
+        print("No geocoded properties found.")
+        conn.close()
+        return
+
+    # Check if we have any comps at all
+    comp_count = conn.execute("SELECT COUNT(*) FROM comparable_sales").fetchone()[0]
+    if comp_count == 0:
+        print("No comparable sales in database. Run comps_redfin or comps_recorder first.")
+        conn.close()
+        return
+
+    print(f"Computing comps estimates for {len(rows)} properties "
+          f"({comp_count} comps in DB, radius={radius_miles}mi, months={months_back})...")
+
+    estimated = 0
+    no_comps = 0
+
+    for i, row in enumerate(rows):
+        doc_num = row["document_number"]
+
+        comps = find_comps(conn, row, radius_miles, months_back)
+
+        if not comps:
+            no_comps += 1
+            logger.debug(f"[{i+1}/{len(rows)}] {doc_num} -> no comps found")
+            continue
+
+        estimate, count, confidence = estimate_from_comps(row, comps)
+
+        if estimate is None:
+            no_comps += 1
+            continue
+
+        update_comps_valuation(conn, doc_num, {
+            "comps_estimate": estimate,
+            "comps_count": count,
+            "comps_confidence": confidence,
+        })
+        estimated += 1
+        logger.info(
+            f"[{i+1}/{len(rows)}] {doc_num} -> ${estimate:,.0f} "
+            f"({count} comps, {confidence})"
+        )
+
+    conn.close()
+    print(f"\nEstimated {estimated}/{len(rows)} properties "
+          f"({no_comps} had no comps within {radius_miles}mi)")
+
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Compute comps-based valuations for properties"
+    )
+    parser.add_argument(
+        "--db", type=str, default=str(DEFAULT_DB),
+        help=f"Database path (default: {DEFAULT_DB})",
+    )
+    parser.add_argument(
+        "--radius", type=float, default=1.5,
+        help="Search radius in miles (default: 1.5)",
+    )
+    parser.add_argument(
+        "--months", type=int, default=6,
+        help="Look-back period in months (default: 6)",
+    )
+    parser.add_argument(
+        "-v", "--verbose", action="store_true",
+        help="Enable verbose logging",
+    )
+    args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.verbose else logging.INFO,
+        format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    )
+
+    enrich_comps_from_db(Path(args.db), args.radius, args.months)
+
+
+if __name__ == "__main__":
+    main()

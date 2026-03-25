@@ -13,6 +13,12 @@ const CASE_BADGE = {
   CV: 'bg-blue-100 text-blue-800',
 };
 
+const CONFIDENCE_BADGE = {
+  high: 'bg-green-100 text-green-800',
+  medium: 'bg-yellow-100 text-yellow-800',
+  low: 'bg-red-100 text-red-800',
+};
+
 const CASE_LABELS = {
   FC: 'Foreclosure',
   CH: 'Chancery',
@@ -25,6 +31,7 @@ const COLUMNS = [
   { key: 'recorded_date', label: 'Filed' },
   { key: 'owner_name', label: 'Owner' },
   { key: 'property_address', label: 'Address' },
+  { key: 'estimated_market_value', label: 'Est. Value' },
   { key: 'tax_status', label: 'Tax Status' },
   { key: 'absentee_owner', label: 'Absentee' },
   { key: 'property_class', label: 'Class' },
@@ -103,6 +110,38 @@ function DetailPanel({ f }) {
       {/* Valuation & Tax */}
       <div className="space-y-3">
         <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Valuation &amp; Tax</h4>
+        <DetailField label="Est. Market Value" value={f.estimated_market_value != null ? formatCurrency(f.estimated_market_value) : null} />
+        {f.valuation_source && (
+          <div>
+            <dt className="text-xs text-gray-500 uppercase tracking-wide">Valuation Source</dt>
+            <dd className="text-sm text-gray-900 mt-0.5 capitalize">{f.valuation_source.replace('_', ' ')}</dd>
+          </div>
+        )}
+        {f.valuation_confidence && (
+          <div>
+            <dt className="text-xs text-gray-500 uppercase tracking-wide">Confidence</dt>
+            <dd className="mt-0.5">
+              <Badge text={f.valuation_confidence} className={CONFIDENCE_BADGE[f.valuation_confidence] || 'bg-gray-100 text-gray-700'} />
+            </dd>
+          </div>
+        )}
+        {f.comps_estimate != null && (
+          <>
+            <DetailField label="Comps Estimate" value={formatCurrency(f.comps_estimate)} />
+            <div>
+              <dt className="text-xs text-gray-500 uppercase tracking-wide">Comps</dt>
+              <dd className="text-sm text-gray-900 mt-0.5">
+                {f.comps_count != null ? `${f.comps_count} comp${f.comps_count !== 1 ? 's' : ''}` : '—'}
+                {f.comps_confidence && (
+                  <Badge
+                    text={f.comps_confidence}
+                    className={`ml-1.5 ${CONFIDENCE_BADGE[f.comps_confidence] || 'bg-gray-100 text-gray-700'}`}
+                  />
+                )}
+              </dd>
+            </div>
+          </>
+        )}
         <DetailField label="Assessed Value" value={formatCurrency(f.assessed_value)} />
         <DetailField label="Net Taxable Value" value={formatCurrency(f.net_taxable_value)} />
         <DetailField label="Tax Rate" value={f.tax_rate != null ? f.tax_rate : null} />
@@ -143,7 +182,7 @@ export default function Table({ features }) {
       setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
     } else {
       setSortKey(key);
-      setSortDir(key === 'score' ? 'desc' : 'asc');
+      setSortDir(key === 'score' || key === 'estimated_market_value' ? 'desc' : 'asc');
     }
   }
 
@@ -186,6 +225,18 @@ export default function Table({ features }) {
         return f.owner_name || f.party2 || '—';
       case 'property_address':
         return f.property_address ? f.property_address.replace(/\n/g, ', ') : '—';
+      case 'estimated_market_value':
+        return f.estimated_market_value != null ? (
+          <span className="flex items-center gap-1.5">
+            {formatCurrency(f.estimated_market_value)}
+            {f.valuation_confidence && (
+              <Badge
+                text={f.valuation_confidence}
+                className={CONFIDENCE_BADGE[f.valuation_confidence] || 'bg-gray-100 text-gray-700'}
+              />
+            )}
+          </span>
+        ) : '—';
       case 'tax_status':
         return f.tax_status ? (
           <Badge

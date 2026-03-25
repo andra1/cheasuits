@@ -69,16 +69,33 @@ def blend_estimates(
     assessed_mult: float,
     zillow: Optional[float],
     redfin: Optional[float],
+    comps: Optional[float] = None,
+    comps_confidence: Optional[str] = None,
 ) -> tuple[float, str, str]:
     """Blend valuation signals into a final estimate.
 
     Returns: (estimated_market_value, valuation_source, valuation_confidence)
 
-    Decision matrix:
+    Decision matrix (comps are gold standard when available):
+    - Comps with "high" confidence (3+ comps) -> primary signal
+    - Comps with "medium" confidence -> blend at 60% weight with assessed
     - Both external available -> average, check divergence from assessed
     - One external available -> use it, check divergence from assessed
     - No external -> fall back to assessed multiplier with "medium" confidence
     """
+    # Comps are the gold standard when available
+    if comps is not None and comps > 0:
+        if comps_confidence == "high":
+            return (comps, "comps", "high")
+        elif comps_confidence == "medium":
+            # Blend comps (60%) with assessed multiplier (40%)
+            value = round(comps * 0.6 + assessed_mult * 0.4, 2)
+            return (value, "comps_blended", "medium")
+        else:
+            # Low confidence comps — use as one signal among many
+            # Treat like an external estimate below
+            pass
+
     if zillow is not None and redfin is not None:
         value = round((zillow + redfin) / 2, 2)
         source = "blended"
@@ -88,6 +105,10 @@ def blend_estimates(
     elif redfin is not None:
         value = redfin
         source = "redfin"
+    elif comps is not None and comps > 0:
+        # Low-confidence comps, but nothing else available
+        value = round(comps * 0.5 + assessed_mult * 0.5, 2)
+        return (value, "comps_blended", "low")
     else:
         return (assessed_mult, "assessed_multiplier", "medium")
 
@@ -287,21 +308,35 @@ def fetch_zillow_estimate(address: str) -> Optional[float]:
 # Enrichment Orchestrator
 # ---------------------------------------------------------------------------
 
-def enrich_valuations_from_db(db_path: Path) -> None:
-    """Fetch valuations for all unvalued properties in the database."""
+def enrich_valuations_from_db(db_path: Path, revalue: bool = False) -> None:
+    """Fetch valuations for all unvalued properties in the database.
+
+    Args:
+        revalue: If True, re-run valuation for properties that already have
+                 values (useful after comps data has been added).
+    """
     from src.db.database import (
         get_db, get_unvalued, update_valuation, set_valuation_error,
     )
 
     conn = get_db(db_path)
-    rows = get_unvalued(conn)
+
+    if revalue:
+        # Re-value all properties with assessed_value
+        cursor = conn.execute(
+            "SELECT * FROM properties WHERE assessed_value IS NOT NULL"
+        )
+        rows = [dict(row) for row in cursor.fetchall()]
+    else:
+        rows = get_unvalued(conn)
 
     if not rows:
-        print("No unvalued properties found.")
+        print("No properties to value.")
         conn.close()
         return
 
-    print(f"Valuing {len(rows)} properties...")
+    label = "Re-valuing" if revalue else "Valuing"
+    print(f"{label} {len(rows)} properties...")
 
     valued = 0
     failed = 0
@@ -317,11 +352,15 @@ def enrich_valuations_from_db(db_path: Path) -> None:
             assessed_value, STCLAIR_STATE_MULTIPLIER
         )
 
-        # Step 2: Try external estimates (only if address available)
-        redfin_est = None
-        zillow_est = None
+        # Step 2: Read comps data from DB (already computed by comps.py)
+        comps_est = row.get("comps_estimate")
+        comps_conf = row.get("comps_confidence")
 
-        if address:
+        # Step 3: Try external estimates (only if address available and not revaluing)
+        redfin_est = row.get("redfin_estimate") if revalue else None
+        zillow_est = row.get("zillow_estimate") if revalue else None
+
+        if not revalue and address:
             normalized_addr = _normalize_address(address)
 
             # Try Redfin
@@ -335,13 +374,14 @@ def enrich_valuations_from_db(db_path: Path) -> None:
             zillow_est = fetch_zillow_estimate(normalized_addr)
             request_count += 1
 
-        # Step 3: Blend
+        # Step 4: Blend (now including comps)
         est_value, source, confidence = blend_estimates(
-            assessed_mult, zillow_est, redfin_est
+            assessed_mult, zillow_est, redfin_est, comps_est, comps_conf
         )
 
         if est_value <= 0:
-            set_valuation_error(conn, doc_num, "all methods returned zero or negative")
+            if not revalue:
+                set_valuation_error(conn, doc_num, "all methods returned zero or negative")
             failed += 1
             logger.warning(f"[{i+1}/{len(rows)}] {doc_num} -> FAILED (zero value)")
             continue
@@ -356,6 +396,8 @@ def enrich_valuations_from_db(db_path: Path) -> None:
             fields["zillow_estimate"] = zillow_est
         if redfin_est is not None:
             fields["redfin_estimate"] = redfin_est
+        if comps_est is not None:
+            fields["comps_estimate"] = comps_est
 
         update_valuation(conn, doc_num, fields)
         valued += 1
@@ -365,7 +407,7 @@ def enrich_valuations_from_db(db_path: Path) -> None:
         )
 
     conn.close()
-    print(f"\nValued {valued}/{len(rows)} properties ({failed} failed)")
+    print(f"\n{label.rstrip('ing')}ed {valued}/{len(rows)} properties ({failed} failed)")
 
 
 def main():
@@ -375,6 +417,10 @@ def main():
     parser.add_argument(
         "--db", type=str, default=str(DEFAULT_DB),
         help=f"Database path (default: {DEFAULT_DB})",
+    )
+    parser.add_argument(
+        "--revalue", action="store_true",
+        help="Re-run valuation for all properties (e.g. after adding comps data)",
     )
     parser.add_argument(
         "-v", "--verbose", action="store_true",
@@ -387,7 +433,7 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    enrich_valuations_from_db(Path(args.db))
+    enrich_valuations_from_db(Path(args.db), revalue=args.revalue)
 
 
 if __name__ == "__main__":
