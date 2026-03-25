@@ -35,3 +35,6 @@ data/processed/
 .ipynb_checkpoints/
 .vercel
 data/*.db
+
+# Worktrees
+.worktrees/
