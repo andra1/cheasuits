@@ -8,6 +8,7 @@ from unittest.mock import patch, MagicMock
 from src.enrichment.valuation import (
     compute_assessed_multiplier,
     blend_estimates,
+    fetch_redfin_estimate,
 )
 
 
@@ -73,3 +74,48 @@ class TestBlendEstimates:
         assert value == 100000.0
         assert source == "assessed_multiplier"
         assert confidence == "medium"
+
+
+class TestFetchRedfinEstimate:
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_extracts_estimate_from_page(self, mock_urlopen):
+        # Mock autocomplete response
+        autocomplete_resp = MagicMock()
+        autocomplete_resp.read.return_value = b'{}&&{"payload":{"sections":[{"rows":[{"url":"/IL/Belleville/209-Edwards-St-62220/home/12345"}]}]}}'
+        autocomplete_resp.__enter__ = lambda s: s
+        autocomplete_resp.__exit__ = MagicMock(return_value=False)
+
+        # Mock property page with estimate in script tag
+        page_html = b"""<html><body>
+        <script id="__NEXT_DATA__" type="application/json">
+        {"props":{"pageProps":{"initialRedfinEstimateValue":125000}}}
+        </script>
+        </body></html>"""
+        page_resp = MagicMock()
+        page_resp.read.return_value = page_html
+        page_resp.__enter__ = lambda s: s
+        page_resp.__exit__ = MagicMock(return_value=False)
+
+        mock_urlopen.side_effect = [autocomplete_resp, page_resp]
+
+        result = fetch_redfin_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result == 125000.0
+
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_returns_none_on_no_autocomplete(self, mock_urlopen):
+        autocomplete_resp = MagicMock()
+        autocomplete_resp.read.return_value = b'{}&&{"payload":{"sections":[]}}'
+        autocomplete_resp.__enter__ = lambda s: s
+        autocomplete_resp.__exit__ = MagicMock(return_value=False)
+        mock_urlopen.return_value = autocomplete_resp
+
+        result = fetch_redfin_estimate("999 Nonexistent Rd, Nowhere, IL 00000")
+        assert result is None
+
+    @patch("src.enrichment.valuation.urllib.request.urlopen")
+    def test_returns_none_on_http_error(self, mock_urlopen):
+        mock_urlopen.side_effect = urllib.error.HTTPError(
+            "http://example.com", 403, "Forbidden", {}, None
+        )
+        result = fetch_redfin_estimate("209 Edwards St, Cahokia, IL 62206")
+        assert result is None

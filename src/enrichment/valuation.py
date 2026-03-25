@@ -99,3 +99,116 @@ def blend_estimates(
         confidence = "high"  # can't check divergence without assessed baseline
 
     return (value, source, confidence)
+
+
+# ---------------------------------------------------------------------------
+# Address Normalization
+# ---------------------------------------------------------------------------
+
+def _normalize_address(raw: str) -> str:
+    """Flatten multi-line DB address to single line for URL queries."""
+    return raw.replace("\n", ", ").strip()
+
+
+def _get_user_agent() -> str:
+    """Return a random user agent string."""
+    return random.choice(USER_AGENTS)
+
+
+# ---------------------------------------------------------------------------
+# Redfin Scraper
+# ---------------------------------------------------------------------------
+
+def fetch_redfin_estimate(address: str) -> Optional[float]:
+    """Fetch Redfin Estimate for a property address.
+
+    1. Hit autocomplete endpoint to resolve address -> property URL
+    2. Fetch property page
+    3. Extract estimate from __NEXT_DATA__ JSON
+
+    Returns estimated value or None if unavailable.
+    """
+    normalized = _normalize_address(address)
+    encoded = urllib.parse.quote(normalized)
+
+    # Step 1: Autocomplete to get property URL
+    autocomplete_url = (
+        f"https://www.redfin.com/stingray/do/location-autocomplete"
+        f"?v=2&al=1&location={encoded}"
+    )
+
+    try:
+        req = urllib.request.Request(autocomplete_url, headers={
+            "User-Agent": _get_user_agent(),
+            "Accept": "application/json",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            raw = resp.read().decode("utf-8")
+
+        # Redfin prefixes response with '{}&&'
+        json_str = raw.split("&&", 1)[-1] if "&&" in raw else raw
+        data = json.loads(json_str)
+
+        sections = data.get("payload", {}).get("sections", [])
+        if not sections:
+            logger.debug(f"Redfin: no autocomplete results for {normalized}")
+            return None
+
+        rows = sections[0].get("rows", [])
+        if not rows:
+            logger.debug(f"Redfin: no rows in autocomplete for {normalized}")
+            return None
+
+        property_url = rows[0].get("url", "")
+        if not property_url:
+            return None
+
+    except Exception as e:
+        logger.warning(f"Redfin autocomplete failed for {normalized}: {e}")
+        return None
+
+    # Step 2: Fetch property page
+    try:
+        page_url = f"https://www.redfin.com{property_url}"
+        req = urllib.request.Request(page_url, headers={
+            "User-Agent": _get_user_agent(),
+            "Accept": "text/html",
+        })
+        with urllib.request.urlopen(req, timeout=15) as resp:
+            html = resp.read().decode("utf-8")
+
+    except Exception as e:
+        logger.warning(f"Redfin page fetch failed for {property_url}: {e}")
+        return None
+
+    # Step 3: Extract estimate from __NEXT_DATA__ or page content
+    try:
+        # Try __NEXT_DATA__ JSON blob
+        match = re.search(
+            r'<script[^>]*id="__NEXT_DATA__"[^>]*>(.*?)</script>',
+            html, re.DOTALL
+        )
+        if match:
+            page_data = json.loads(match.group(1))
+            estimate = (
+                page_data.get("props", {})
+                .get("pageProps", {})
+                .get("initialRedfinEstimateValue")
+            )
+            if estimate and isinstance(estimate, (int, float)) and estimate > 0:
+                logger.info(f"Redfin estimate for {normalized}: ${estimate:,.0f}")
+                return float(estimate)
+
+        # Fallback: search for avm pattern in HTML
+        avm_match = re.search(r'"avm":\s*\{[^}]*"amount":\s*(\d+)', html)
+        if avm_match:
+            estimate = float(avm_match.group(1))
+            if estimate > 0:
+                logger.info(f"Redfin AVM for {normalized}: ${estimate:,.0f}")
+                return estimate
+
+    except (json.JSONDecodeError, KeyError, ValueError) as e:
+        logger.warning(f"Redfin parse failed for {normalized}: {e}")
+
+    logger.debug(f"Redfin: no estimate found for {normalized}")
+    return None
