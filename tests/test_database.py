@@ -17,6 +17,9 @@ from src.db.database import (
     get_unvalued,
     update_valuation,
     set_valuation_error,
+    upsert_vacancy_records,
+    get_vacancy_by_tract,
+    get_vacancy_summary,
 )
 
 
@@ -214,3 +217,63 @@ class TestUpdateValuation:
         assert row["valuation_source"] == "zillow"
         assert row["valuation_confidence"] == "high"
         assert row["valued_at"] is not None
+
+
+SAMPLE_VACANCY = {
+    "geoid": "17163000100",
+    "state_fips": "17",
+    "county_fips": "163",
+    "tract_code": "000100",
+    "year": 2025,
+    "quarter": 1,
+    "total_residential": 500,
+    "vacant_residential": 25,
+    "vacancy_rate_residential": 5.0,
+    "no_stat_residential": 10,
+    "total_business": 50,
+    "vacant_business": 5,
+    "vacancy_rate_business": 10.0,
+    "no_stat_business": 2,
+    "scraped_at": "2026-03-25T10:00:00",
+}
+
+
+class TestUspsVacancyTable:
+    def test_table_created(self, db):
+        cursor = db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name='usps_vacancy'"
+        )
+        assert cursor.fetchone() is not None
+
+    def test_upsert_insert(self, db):
+        count = upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        assert count == 1
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 1
+        assert rows[0]["total_residential"] == 500
+        assert rows[0]["vacant_residential"] == 25
+
+    def test_upsert_updates_on_conflict(self, db):
+        upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        updated = {**SAMPLE_VACANCY, "vacant_residential": 30, "vacancy_rate_residential": 6.0}
+        upsert_vacancy_records(db, [updated])
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 1
+        assert rows[0]["vacant_residential"] == 30
+
+    def test_upsert_empty_list(self, db):
+        count = upsert_vacancy_records(db, [])
+        assert count == 0
+
+    def test_get_vacancy_by_tract(self, db):
+        rec_q1 = {**SAMPLE_VACANCY}
+        rec_q2 = {**SAMPLE_VACANCY, "quarter": 2, "vacant_residential": 30}
+        upsert_vacancy_records(db, [rec_q1, rec_q2])
+        rows = get_vacancy_by_tract(db, "17163000100")
+        assert len(rows) == 2
+
+    def test_get_vacancy_summary(self, db):
+        upsert_vacancy_records(db, [SAMPLE_VACANCY])
+        summary = get_vacancy_summary(db, state_fips="17")
+        assert len(summary) >= 1
+        assert summary[0]["geoid"] == "17163000100"

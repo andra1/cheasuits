@@ -85,6 +85,30 @@ CREATE INDEX IF NOT EXISTS idx_dt_parcel_id ON delinquent_taxes(parcel_id);
 CREATE INDEX IF NOT EXISTS idx_dt_city ON delinquent_taxes(city);
 CREATE INDEX IF NOT EXISTS idx_dt_publication_year ON delinquent_taxes(publication_year);
 CREATE INDEX IF NOT EXISTS idx_dt_enriched_at ON delinquent_taxes(enriched_at);
+
+CREATE TABLE IF NOT EXISTS usps_vacancy (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    geoid TEXT NOT NULL,
+    state_fips TEXT NOT NULL,
+    county_fips TEXT NOT NULL,
+    tract_code TEXT NOT NULL,
+    year INTEGER NOT NULL,
+    quarter INTEGER NOT NULL,
+    total_residential INTEGER,
+    vacant_residential INTEGER,
+    vacancy_rate_residential REAL,
+    no_stat_residential INTEGER,
+    total_business INTEGER,
+    vacant_business INTEGER,
+    vacancy_rate_business REAL,
+    no_stat_business INTEGER,
+    scraped_at TEXT,
+    UNIQUE(geoid, year, quarter)
+);
+
+CREATE INDEX IF NOT EXISTS idx_vac_geoid ON usps_vacancy(geoid);
+CREATE INDEX IF NOT EXISTS idx_vac_state ON usps_vacancy(state_fips);
+CREATE INDEX IF NOT EXISTS idx_vac_year_qtr ON usps_vacancy(year, quarter);
 """
 
 INGESTION_COLUMNS = [
@@ -383,4 +407,84 @@ def get_delinquent_overlap(conn: sqlite3.Connection) -> list[dict]:
         WHERE dt.parcel_id != '' AND p.parcel_id != ''
         ORDER BY dt.city, dt.street
     """)
+    return [dict(row) for row in cursor.fetchall()]
+
+
+# ---------------------------------------------------------------------------
+# USPS vacancy table helpers
+# ---------------------------------------------------------------------------
+
+def upsert_vacancy_records(conn: sqlite3.Connection, records: list[dict]) -> int:
+    """Insert or update USPS vacancy records. Keyed on (geoid, year, quarter).
+
+    Returns number of records upserted.
+    """
+    if not records:
+        return 0
+
+    cols = [
+        "state_fips", "county_fips", "tract_code",
+        "total_residential", "vacant_residential", "vacancy_rate_residential",
+        "no_stat_residential", "total_business", "vacant_business",
+        "vacancy_rate_business", "no_stat_business", "scraped_at",
+    ]
+    update_clause = ", ".join(f"{col} = excluded.{col}" for col in cols)
+
+    sql = f"""
+        INSERT INTO usps_vacancy (geoid, year, quarter, {", ".join(cols)})
+        VALUES (:geoid, :year, :quarter, {", ".join(":" + c for c in cols)})
+        ON CONFLICT(geoid, year, quarter) DO UPDATE SET {update_clause}
+    """
+
+    for record in records:
+        params = {
+            "geoid": record["geoid"],
+            "year": record["year"],
+            "quarter": record["quarter"],
+        }
+        for col in cols:
+            params[col] = record.get(col, "")
+        conn.execute(sql, params)
+
+    conn.commit()
+    return len(records)
+
+
+def get_vacancy_by_tract(conn: sqlite3.Connection, geoid: str) -> list[dict]:
+    """Get all vacancy records for a specific census tract GEOID."""
+    cursor = conn.execute(
+        "SELECT * FROM usps_vacancy WHERE geoid = ? ORDER BY year, quarter",
+        (geoid,),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def get_vacancy_summary(
+    conn: sqlite3.Connection,
+    state_fips: str | None = None,
+    county_fips: str | None = None,
+    year: int | None = None,
+    quarter: int | None = None,
+) -> list[dict]:
+    """Get vacancy summary with optional filters."""
+    conditions = []
+    params = []
+    if state_fips:
+        conditions.append("state_fips = ?")
+        params.append(state_fips)
+    if county_fips:
+        conditions.append("county_fips = ?")
+        params.append(county_fips)
+    if year:
+        conditions.append("year = ?")
+        params.append(year)
+    if quarter:
+        conditions.append("quarter = ?")
+        params.append(quarter)
+
+    where = " AND ".join(conditions) if conditions else "1=1"
+    cursor = conn.execute(
+        f"SELECT * FROM usps_vacancy WHERE {where} ORDER BY geoid, year, quarter",
+        params,
+    )
     return [dict(row) for row in cursor.fetchall()]
