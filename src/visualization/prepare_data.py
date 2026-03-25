@@ -133,9 +133,16 @@ def read_db(db_path: Path) -> list[dict]:
             "absentee_owner": bool(row["absentee_owner"]) if row["absentee_owner"] is not None else False,
             "assessed_value": row["assessed_value"],
             "net_taxable_value": row["net_taxable_value"],
+            "tax_rate": row["tax_rate"],
+            "total_tax": row["total_tax"],
             "tax_status": row["tax_status"] or "",
             "property_class": row["property_class"] or "",
             "acres": row["acres"],
+            # Valuation fields
+            "estimated_market_value": row["estimated_market_value"],
+            "valuation_source": row["valuation_source"] or "",
+            "valuation_confidence": row["valuation_confidence"] or "",
+            "valued_at": row["valued_at"] or "",
         })
 
     return records
@@ -333,7 +340,10 @@ def build_output(records: list[dict]) -> dict:
         # Include assessor fields if present
         for field in ("owner_name", "property_address", "mailing_address",
                       "absentee_owner", "assessed_value", "net_taxable_value",
-                      "tax_status", "property_class", "acres"):
+                      "tax_rate", "total_tax",
+                      "tax_status", "property_class", "acres",
+                      "estimated_market_value", "valuation_source",
+                      "valuation_confidence", "valued_at"):
             if field in r:
                 feature[field] = r[field]
         features.append(feature)
