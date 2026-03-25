@@ -30,7 +30,7 @@ logger = logging.getLogger(__name__)
 
 BASE_URL = "https://stclairil.devnetwedge.com/parcel/view"
 DEFAULT_DB = Path(__file__).resolve().parent.parent.parent / "data" / "cheasuits.db"
-DEFAULT_YEAR = datetime.now().year - 1
+DEFAULT_YEAR = datetime.now().year - 2  # county data lags ~1 year; most recent complete year
 REQUEST_DELAY = 0.3
 MAX_RETRIES = 3
 
@@ -98,6 +98,24 @@ def parse_assessor_html(html: str, parcel_id: str) -> AssessorRecord:
     net_taxable_text = _get_field_text(soup, "Net Taxable Value")
     net_taxable_value = _parse_currency(net_taxable_text)
 
+    # Parse assessed value from "Board of Review Equalized" row in valuation table
+    assessed_value = None
+    for table in soup.find_all("table"):
+        if "Equalized" not in table.get_text():
+            continue
+        for tr in table.find_all("tr"):
+            cells = [td.get_text(strip=True) for td in tr.find_all("td")]
+            if cells and "board of review equalized" in cells[0].lower():
+                # "Total" column is index 6 (after Homesite, Dwelling, Farm Land, Farm Building, Mineral)
+                for cell_text in reversed(cells[1:]):
+                    val = _parse_currency(cell_text)
+                    if val and val > 0:
+                        assessed_value = val
+                        break
+                break
+        if assessed_value:
+            break
+
     tax_rate_text = _get_field_text(soup, "Tax Rate")
     tax_rate = float(re.sub(r"[^\d.]", "", tax_rate_text)) if tax_rate_text and tax_rate_text != "Unavailable" else None
 
@@ -149,7 +167,7 @@ def parse_assessor_html(html: str, parcel_id: str) -> AssessorRecord:
         property_address=property_address,
         mailing_address=mailing_address,
         absentee_owner=absentee,
-        assessed_value=net_taxable_value,
+        assessed_value=assessed_value,
         net_taxable_value=net_taxable_value,
         tax_rate=tax_rate,
         total_tax=total_tax,
@@ -281,6 +299,74 @@ def enrich_from_db(db_path: Path, year: int) -> None:
         print(f"  Notable: {tax_sold} properties with taxes sold at auction")
 
 
+def enrich_delinquent_from_db(db_path: Path, year: int) -> None:
+    """Fetch assessor data for all unenriched delinquent tax records."""
+    from src.db.database import (
+        get_db, get_unenriched_delinquent, update_delinquent_enrichment,
+        set_delinquent_enrichment_error,
+    )
+
+    conn = get_db(db_path)
+    rows = get_unenriched_delinquent(conn)
+
+    if not rows:
+        print("No unenriched delinquent tax records found.")
+        conn.close()
+        return
+
+    print(f"Enriching {len(rows)} delinquent tax records from DevNetWedge (year={year})...")
+
+    enriched = 0
+    failed = 0
+    tax_sold = 0
+    cache: dict[str, Optional[AssessorRecord]] = {}
+
+    for i, row in enumerate(rows):
+        parcel_id = row["parcel_id"]
+
+        if parcel_id in cache:
+            record = cache[parcel_id]
+            if record:
+                update_delinquent_enrichment(conn, row["id"], record.to_db_dict())
+                enriched += 1
+            else:
+                set_delinquent_enrichment_error(conn, row["id"], "cached failure")
+                failed += 1
+            continue
+
+        if i > 0:
+            time.sleep(REQUEST_DELAY)
+
+        try:
+            record = fetch_parcel(parcel_id, year)
+        except ValueError as e:
+            logger.warning(f"[{i+1}/{len(rows)}] {parcel_id} -> {e}")
+            set_delinquent_enrichment_error(conn, row["id"], str(e))
+            cache[parcel_id] = None
+            failed += 1
+            continue
+
+        cache[parcel_id] = record
+
+        if record:
+            update_delinquent_enrichment(conn, row["id"], record.to_db_dict())
+            enriched += 1
+            if record.tax_status == "sold":
+                tax_sold += 1
+            if (i + 1) % 100 == 0:
+                logger.info(f"[{i+1}/{len(rows)}] Progress: {enriched} enriched, {failed} failed")
+        else:
+            set_delinquent_enrichment_error(conn, row["id"],
+                                            "fetch failed after retries")
+            failed += 1
+
+    conn.close()
+
+    print(f"\nEnriched {enriched}/{len(rows)} records ({failed} failed)")
+    if tax_sold:
+        print(f"  Notable: {tax_sold} properties with taxes sold at auction")
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Enrich lis pendens records with assessor data from DevNetWedge"
@@ -294,6 +380,10 @@ def main():
         help=f"Tax year to query (default: {DEFAULT_YEAR})"
     )
     parser.add_argument(
+        "--table", choices=["properties", "delinquent"], default="properties",
+        help="Which table to enrich: 'properties' (lis pendens) or 'delinquent' (tax list). Default: properties"
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging"
     )
@@ -305,7 +395,10 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    enrich_from_db(Path(args.db), args.year)
+    if args.table == "delinquent":
+        enrich_delinquent_from_db(Path(args.db), args.year)
+    else:
+        enrich_from_db(Path(args.db), args.year)
 
 
 if __name__ == "__main__":

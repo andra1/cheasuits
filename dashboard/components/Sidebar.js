@@ -13,7 +13,7 @@ export default function Sidebar({ data }) {
   return (
     <aside className="w-72 bg-gray-900 text-gray-100 p-5 flex flex-col gap-5 overflow-y-auto shrink-0">
       <div>
-        <h1 className="text-lg font-bold leading-tight">Lis Pendens Map</h1>
+        <h1 className="text-lg font-bold leading-tight">Lis Pendens Dashboard</h1>
         <p className="text-xs text-gray-400 mt-0.5">St. Clair County, IL</p>
       </div>
 
