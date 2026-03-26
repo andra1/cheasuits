@@ -4,8 +4,14 @@ Discovers nearby parcels via ArcGIS spatial query, then scrapes sales
 history from each parcel's DevNetWedge page. Stores arm's-length
 transactions in the comparable_sales table.
 
+Optimizations over naive per-property approach:
+- Grid-based clustering reduces ArcGIS calls from N-properties to ~20 cells
+- SQLite progress table allows resuming interrupted runs
+- Batch commits every 50 parcels
+
 Usage:
     python -m src.enrichment.comps_recorder [--db data/cheasuits.db] [--radius 1.5] [--months 6] [-v]
+    python -m src.enrichment.comps_recorder --reset  # clear progress and re-scrape
 """
 
 from __future__ import annotations
@@ -13,6 +19,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import math
 import re
 import time
 import urllib.error
@@ -20,7 +27,6 @@ import urllib.parse
 import urllib.request
 from datetime import datetime, date
 from pathlib import Path
-from typing import Optional
 
 from bs4 import BeautifulSoup
 
@@ -39,12 +45,6 @@ ARCGIS_URL = (
 REQUEST_DELAY = 0.3
 MAX_RETRIES = 3
 
-# Sale types to include (arm's-length transactions)
-INCLUDE_SALE_TYPES = {
-    "warranty deed", "special warranty deed", "trustees deed",
-    "trustee's deed", "wd", "swd", "td",
-}
-
 # Sale types to exclude (non-arm's-length)
 EXCLUDE_SALE_TYPES = {
     "quit claim deed", "qcd", "qc", "quit claim",
@@ -52,6 +52,73 @@ EXCLUDE_SALE_TYPES = {
 
 # Minimum sale price to be considered arm's-length
 MIN_SALE_PRICE = 100
+
+
+# ---------------------------------------------------------------------------
+# Progress tracking (SQLite table)
+# ---------------------------------------------------------------------------
+
+_PROGRESS_SCHEMA = """
+CREATE TABLE IF NOT EXISTS recorder_progress (
+    parcel_number TEXT PRIMARY KEY,
+    lat REAL,
+    lng REAL,
+    scraped_at TEXT,
+    sales_found INTEGER DEFAULT 0
+);
+"""
+
+
+def _ensure_progress_table(conn):
+    conn.executescript(_PROGRESS_SCHEMA)
+    conn.commit()
+
+
+def _get_scraped_parcels(conn) -> set[str]:
+    """Return set of parcel numbers already scraped."""
+    _ensure_progress_table(conn)
+    cursor = conn.execute("SELECT parcel_number FROM recorder_progress")
+    return {row[0] for row in cursor.fetchall()}
+
+
+def _mark_scraped(conn, parcel_number: str, sales_found: int, lat=None, lng=None):
+    conn.execute(
+        "INSERT OR REPLACE INTO recorder_progress "
+        "(parcel_number, lat, lng, scraped_at, sales_found) VALUES (?, ?, ?, ?, ?)",
+        (parcel_number, lat, lng, datetime.now().isoformat(timespec="seconds"),
+         sales_found),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Grid-based location clustering
+# ---------------------------------------------------------------------------
+
+def _cluster_locations(locations: list[dict], cell_size_miles: float) -> list[tuple[float, float]]:
+    """Snap property locations to grid cells and return unique cell centroids.
+
+    Each cell covers cell_size_miles × cell_size_miles. Properties in the
+    same cell share one ArcGIS query instead of getting individual queries.
+    """
+    lat_step = cell_size_miles / 69.0
+    # Use median latitude for lng step (good enough for one county)
+    med_lat = sorted(loc["lat"] for loc in locations)[len(locations) // 2]
+    lng_step = cell_size_miles / (69.0 * math.cos(math.radians(med_lat)))
+
+    cells: dict[tuple[int, int], list[tuple[float, float]]] = {}
+    for loc in locations:
+        ci = int(loc["lat"] / lat_step)
+        cj = int(loc["lng"] / lng_step)
+        cells.setdefault((ci, cj), []).append((loc["lat"], loc["lng"]))
+
+    # Return centroid of each occupied cell
+    centroids = []
+    for pts in cells.values():
+        avg_lat = sum(p[0] for p in pts) / len(pts)
+        avg_lng = sum(p[1] for p in pts) / len(pts)
+        centroids.append((avg_lat, avg_lng))
+
+    return centroids
 
 
 # ---------------------------------------------------------------------------
@@ -67,9 +134,6 @@ def discover_nearby_parcels(
 
     Returns list of dicts with parcel_number, lat, lng (centroid).
     """
-    import math
-
-    # Compute bounding box envelope
     lat_delta = radius_miles / 69.0
     lng_delta = radius_miles / (69.0 * math.cos(math.radians(lat)))
 
@@ -90,7 +154,7 @@ def discover_nearby_parcels(
         "outFields": "parcel_number",
         "returnGeometry": "true",
         "outSR": "4326",
-        "resultRecordCount": "500",
+        "resultRecordCount": "1000",
         "f": "json",
     })
 
@@ -129,7 +193,7 @@ def discover_nearby_parcels(
                     "lng": plng,
                 })
 
-            logger.info(f"ArcGIS found {len(parcels)} parcels near ({lat}, {lng})")
+            logger.info(f"ArcGIS found {len(parcels)} parcels near ({lat:.4f}, {lng:.4f})")
             return parcels
 
         except Exception as e:
@@ -162,16 +226,12 @@ def _is_arm_length(sale_type: str, price: float | None) -> bool:
     """Determine if a sale is arm's-length based on type and price."""
     st = sale_type.lower().strip()
 
-    # Explicit exclude
     if any(exc in st for exc in EXCLUDE_SALE_TYPES):
         return False
 
-    # Price filter
     if price is None or price < MIN_SALE_PRICE:
         return False
 
-    # If sale type matches include list or is unrecognized, include it
-    # (many recorder offices use non-standard names)
     return True
 
 
@@ -183,7 +243,6 @@ def parse_sales_history(html: str, parcel_id: str) -> list[dict]:
     """
     soup = BeautifulSoup(html, "html.parser")
 
-    # Find the Sales History section
     sales_table = None
     for table in soup.find_all("table"):
         header_text = table.get_text().lower()
@@ -203,19 +262,16 @@ def parse_sales_history(html: str, parcel_id: str) -> list[dict]:
         if len(cells) < 7:
             continue
 
-        # Columns: Year, Document#, Sale Type, Sale Date, Sold By, Sold To, Gross Price, ...
         sale_type = cells[2] if len(cells) > 2 else ""
         sale_date_raw = cells[3] if len(cells) > 3 else ""
         gross_price = _parse_currency(cells[6]) if len(cells) > 6 else None
 
-        # Net price is preferred if available
         net_price = _parse_currency(cells[8]) if len(cells) > 8 else None
         price = net_price if net_price and net_price > 0 else gross_price
 
         if not _is_arm_length(sale_type, price):
             continue
 
-        # Parse sale date
         sale_date = ""
         for fmt in ("%m/%d/%Y", "%m-%d-%Y", "%Y-%m-%d", "%m/%d/%y"):
             try:
@@ -245,10 +301,7 @@ def fetch_parcel_sales(
     parcel_id: str,
     year: int | None = None,
 ) -> list[dict]:
-    """Fetch a DevNetWedge parcel page and extract sales history.
-
-    Returns list of sale records.
-    """
+    """Fetch a DevNetWedge parcel page and extract sales history."""
     stripped = strip_parcel_hyphens(parcel_id)
     yr = year or (datetime.now().year - 2)
     url = f"{DEVNET_BASE_URL}/{stripped}/{yr}"
@@ -290,18 +343,61 @@ def fetch_parcel_sales(
 # Orchestrator
 # ---------------------------------------------------------------------------
 
+def _rank_parcels_by_proximity(
+    all_parcels: dict[str, dict],
+    locations: list[dict],
+    max_per_property: int = 30,
+) -> list[dict]:
+    """Return the closest parcels to each property, deduplicated.
+
+    Instead of scraping all ~27K discovered parcels, pick the nearest
+    max_per_property parcels to each subject property. After dedup this
+    keeps the scrape count manageable (~2-4K) while covering every
+    property's neighborhood.
+    """
+    from src.enrichment.comps import haversine_distance
+
+    selected: dict[str, dict] = {}
+
+    for loc in locations:
+        scored = []
+        for pnum, p in all_parcels.items():
+            if p.get("lat") is None or p.get("lng") is None:
+                continue
+            dist = haversine_distance(loc["lat"], loc["lng"], p["lat"], p["lng"])
+            scored.append((dist, pnum, p))
+
+        scored.sort(key=lambda x: x[0])
+
+        for _, pnum, p in scored[:max_per_property]:
+            if pnum not in selected:
+                selected[pnum] = p
+
+    return list(selected.values())
+
+
 def fetch_area_comps(
     db_path: Path,
     radius_miles: float = 1.5,
     months_back: int = 6,
+    reset: bool = False,
 ) -> int:
     """Discover nearby parcels for each property, scrape sales, and store.
+
+    Uses grid-based clustering to minimize ArcGIS calls, proximity ranking
+    to limit scrape volume, and a progress table for resumption.
 
     Returns total number of comparable sales stored.
     """
     from src.db.database import get_db, upsert_comparable_sales
 
     conn = get_db(db_path)
+    _ensure_progress_table(conn)
+
+    if reset:
+        conn.execute("DELETE FROM recorder_progress")
+        conn.commit()
+        print("Cleared recorder progress — starting fresh.")
 
     # Get distinct property locations
     cursor = conn.execute(
@@ -315,27 +411,44 @@ def fetch_area_comps(
         conn.close()
         return 0
 
-    print(f"Discovering parcels near {len(locations)} property locations "
-          f"(radius={radius_miles}mi)...")
+    # --- Phase 1: Clustered ArcGIS discovery ---
+    cell_size = radius_miles * 2
+    centroids = _cluster_locations(locations, cell_size)
+    print(f"Phase 1: Querying ArcGIS for {len(centroids)} grid cells "
+          f"(clustered from {len(locations)} property locations)...")
 
-    # Collect all nearby parcels (deduplicated)
     all_parcels: dict[str, dict] = {}
-    for i, loc in enumerate(locations):
+    for i, (clat, clng) in enumerate(centroids):
         if i > 0:
             time.sleep(REQUEST_DELAY)
 
-        parcels = discover_nearby_parcels(loc["lat"], loc["lng"], radius_miles)
+        parcels = discover_nearby_parcels(clat, clng, radius_miles)
         for p in parcels:
             pnum = p["parcel_number"]
             if pnum not in all_parcels:
                 all_parcels[pnum] = p
 
-        logger.info(f"[{i+1}/{len(locations)}] Found {len(parcels)} parcels "
-                     f"near ({loc['lat']}, {loc['lng']})")
+        logger.info(f"[{i+1}/{len(centroids)}] Cell ({clat:.4f}, {clng:.4f}) "
+                     f"-> {len(parcels)} parcels (total unique: {len(all_parcels)})")
 
-    print(f"Found {len(all_parcels)} unique parcels to check for sales history")
+    print(f"Phase 1 complete: {len(all_parcels)} unique parcels discovered")
 
-    # Fetch sales history for each parcel
+    # --- Phase 1b: Rank by proximity to subject properties ---
+    ranked = _rank_parcels_by_proximity(all_parcels, locations, max_per_property=30)
+    print(f"Ranked to {len(ranked)} parcels (nearest 30 per property, deduplicated)")
+
+    # Filter out already-scraped parcels
+    already_scraped = _get_scraped_parcels(conn)
+    remaining = [p for p in ranked if p["parcel_number"] not in already_scraped]
+
+    print(f"{len(already_scraped)} already scraped, {len(remaining)} to scrape")
+
+    if not remaining:
+        print("All parcels already scraped. Use --reset to re-scrape.")
+        conn.close()
+        return 0
+
+    # --- Phase 2: Scrape sales history with checkpointing ---
     cutoff = date.today().replace(
         month=max(1, date.today().month - months_back % 12),
         year=date.today().year - months_back // 12,
@@ -344,16 +457,22 @@ def fetch_area_comps(
 
     total_stored = 0
     parcels_with_sales = 0
+    errors = 0
 
-    parcel_list = list(all_parcels.values())
-    for i, parcel in enumerate(parcel_list):
+    est_minutes = len(remaining) * REQUEST_DELAY / 60
+    print(f"Phase 2: Scraping sales history for {len(remaining)} parcels "
+          f"(~{est_minutes:.0f} min)...")
+
+    for i, parcel in enumerate(remaining):
         if i > 0:
             time.sleep(REQUEST_DELAY)
 
         pnum = parcel["parcel_number"]
         sales = fetch_parcel_sales(pnum)
 
-        if not sales:
+        if sales is None:
+            errors += 1
+            _mark_scraped(conn, pnum, 0, parcel.get("lat"), parcel.get("lng"))
             continue
 
         # Filter by date and build records for DB
@@ -362,9 +481,6 @@ def fetch_area_comps(
             if sale["sale_date"] < cutoff_str:
                 continue
 
-            # Build address from parcel info (we'll use the parcel_id as proxy)
-            # The address comes from the DevNetWedge page, but we already have
-            # parcel coordinates from ArcGIS
             records.append({
                 "address": f"Parcel {pnum}",
                 "lat": parcel.get("lat"),
@@ -386,14 +502,21 @@ def fetch_area_comps(
             count = upsert_comparable_sales(conn, records)
             total_stored += count
             parcels_with_sales += 1
-            logger.info(f"[{i+1}/{len(parcel_list)}] {pnum} -> {count} sales stored")
+            logger.info(f"[{i+1}/{len(remaining)}] {pnum} -> {count} sales stored")
 
+        # Mark as scraped (even if no sales — so we don't re-scrape)
+        _mark_scraped(conn, pnum, len(records), parcel.get("lat"), parcel.get("lng"))
+
+        # Batch commit and progress every 50 parcels
         if (i + 1) % 50 == 0:
-            print(f"  Progress: {i+1}/{len(parcel_list)} parcels checked, "
-                  f"{total_stored} sales stored")
+            conn.commit()
+            print(f"  Progress: {i+1}/{len(remaining)} parcels scraped, "
+                  f"{total_stored} sales stored, {errors} errors")
 
+    conn.commit()
     conn.close()
-    print(f"\nStored {total_stored} recorder sales from {parcels_with_sales} parcels")
+    print(f"\nDone! Stored {total_stored} recorder sales from "
+          f"{parcels_with_sales}/{len(remaining)} parcels ({errors} errors)")
     return total_stored
 
 
@@ -414,6 +537,10 @@ def main():
         help="Look-back period in months (default: 6)",
     )
     parser.add_argument(
+        "--reset", action="store_true",
+        help="Clear progress table and re-scrape all parcels",
+    )
+    parser.add_argument(
         "-v", "--verbose", action="store_true",
         help="Enable verbose logging",
     )
@@ -424,7 +551,7 @@ def main():
         format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
     )
 
-    fetch_area_comps(Path(args.db), args.radius, args.months)
+    fetch_area_comps(Path(args.db), args.radius, args.months, args.reset)
 
 
 if __name__ == "__main__":

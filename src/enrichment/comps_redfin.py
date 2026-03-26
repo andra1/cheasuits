@@ -17,7 +17,7 @@ import re
 import urllib.error
 import urllib.parse
 import urllib.request
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -78,6 +78,16 @@ def _parse_lot_size(raw: str) -> float | None:
         except ValueError:
             pass
 
+    # Bare number — assume square feet (Redfin sometimes omits the unit)
+    bare_match = re.fullmatch(r'[\d,.]+', raw.strip())
+    if bare_match:
+        try:
+            sqft = float(raw.strip().replace(",", ""))
+            if sqft > 0:
+                return round(sqft / 43560.0, 4)
+        except ValueError:
+            pass
+
     return None
 
 
@@ -101,7 +111,7 @@ def _parse_float(raw: str | None) -> float | None:
         return None
 
 
-def _parse_redfin_csv(csv_text: str) -> list[dict]:
+def _parse_redfin_csv(csv_text: str, sold_within_days: int = 180) -> list[dict]:
     """Parse Redfin CSV text into comparable_sales records.
 
     Redfin CSV columns include: SALE TYPE, SOLD DATE, PROPERTY TYPE, ADDRESS,
@@ -110,7 +120,14 @@ def _parse_redfin_csv(csv_text: str) -> list[dict]:
     """
     records = []
 
-    reader = csv.DictReader(io.StringIO(csv_text))
+    # Redfin inserts a disclaimer line after the header — strip it so
+    # DictReader doesn't choke on a row with mostly-None values.
+    lines = csv_text.splitlines(keepends=True)
+    cleaned_lines = [
+        line for line in lines
+        if not line.strip().startswith('"In accordance with')
+    ]
+    reader = csv.DictReader(io.StringIO("".join(cleaned_lines)))
 
     for row in reader:
         address_parts = [
@@ -122,22 +139,28 @@ def _parse_redfin_csv(csv_text: str) -> list[dict]:
         address = ", ".join(p for p in address_parts if p)
 
         price = _parse_float(row.get("PRICE"))
-        sold_date = row.get("SOLD DATE", "").strip()
+        sold_date_raw = row.get("SOLD DATE", "").strip()
 
-        if not address or not price or price <= 0 or not sold_date:
+        if not address or not price or price <= 0:
             continue
 
-        # Normalize date to YYYY-MM-DD
-        try:
-            parsed_date = datetime.strptime(sold_date, "%B %d, %Y")
-            sale_date = parsed_date.strftime("%Y-%m-%d")
-        except ValueError:
+        # Normalize date to YYYY-MM-DD.  Redfin's county-level CSV often
+        # omits SOLD DATE for "PAST SALE" rows — use midpoint of the
+        # lookback window as a reasonable approximation.
+        if sold_date_raw:
             try:
-                parsed_date = datetime.strptime(sold_date, "%b %d, %Y")
+                parsed_date = datetime.strptime(sold_date_raw, "%B %d, %Y")
                 sale_date = parsed_date.strftime("%Y-%m-%d")
             except ValueError:
-                # Try YYYY-MM-DD directly
-                sale_date = sold_date
+                try:
+                    parsed_date = datetime.strptime(sold_date_raw, "%b %d, %Y")
+                    sale_date = parsed_date.strftime("%Y-%m-%d")
+                except ValueError:
+                    sale_date = sold_date_raw
+        else:
+            # Approximate: midpoint of lookback window
+            approx = datetime.now() - timedelta(days=sold_within_days // 2)
+            sale_date = approx.strftime("%Y-%m-%d")
 
         lat = _parse_float(row.get("LATITUDE"))
         lng = _parse_float(row.get("LONGITUDE"))
@@ -190,7 +213,7 @@ def fetch_redfin_sold(sold_within_days: int = 180) -> list[dict]:
                 logger.warning("Redfin returned empty or tiny response")
                 return []
 
-            records = _parse_redfin_csv(csv_text)
+            records = _parse_redfin_csv(csv_text, sold_within_days)
             logger.info(f"Parsed {len(records)} sold records from Redfin CSV")
             return records
 
