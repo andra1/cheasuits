@@ -5,6 +5,7 @@ import Link from 'next/link';
 import { useRouter } from 'next/router';
 import ScoreBadge from '../../components/ScoreBadge';
 import ScoreBar from '../../components/ScoreBar';
+import CompsCard from '../../components/CompsCard';
 
 const TAX_BADGE = {
   sold: 'bg-red-100 text-red-800',
@@ -424,6 +425,11 @@ export default function PropertyDetail({ property }) {
                 <DetailRow label="Net Taxable Value" value={f.net_taxable_value != null ? formatCurrency(f.net_taxable_value) : null} />
               </div>
             </Card>
+          </div>
+
+          {/* Comparable Sales Card — full width below the grid */}
+          <div className="mt-6">
+            <CompsCard comps={f.comps} valuations={f.valuations} />
           </div>
         </div>
       </div>
