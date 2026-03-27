@@ -75,7 +75,7 @@ def read_csv(csv_path: Path) -> list[dict]:
 
 def read_db(db_path: Path) -> list[dict]:
     """Read property records from the SQLite database."""
-    from src.db.database import get_db, get_all, get_ungeocoded, update_geocoding
+    from src.db.database import get_db, get_all, get_ungeocoded, update_geocoding, get_valuations, get_property_comps
 
     conn = get_db(db_path)
     rows = get_all(conn)
@@ -140,14 +140,65 @@ def read_db(db_path: Path) -> list[dict]:
             "acres": row["acres"],
             # Valuation fields
             "estimated_market_value": row["estimated_market_value"],
-            "valuation_source": row["valuation_source"] or "",
-            "valuation_confidence": row["valuation_confidence"] or "",
             "valued_at": row["valued_at"] or "",
-            # Comps fields
-            "comps_estimate": row.get("comps_estimate"),
-            "comps_count": row.get("comps_count"),
-            "comps_confidence": row.get("comps_confidence") or "",
+            # Mortgage fields
+            "mortgage_amount": row.get("mortgage_amount"),
+            "mortgage_date": row.get("mortgage_date") or "",
+            "mortgage_lender": row.get("mortgage_lender") or "",
+            "total_mortgage_debt": row.get("total_mortgage_debt"),
+            "mortgage_count": row.get("mortgage_count"),
+            "mortgage_source": row.get("mortgage_source") or "",
+            # Lien fields
+            "federal_tax_lien_amount": row.get("federal_tax_lien_amount"),
+            "state_tax_lien_amount": row.get("state_tax_lien_amount"),
+            "judgment_lien_amount": row.get("judgment_lien_amount"),
+            "total_recorded_liens": row.get("total_recorded_liens"),
+            "lien_count": row.get("lien_count"),
+            # Viability fields
+            "total_lien_burden": row.get("total_lien_burden"),
+            "equity_spread": row.get("equity_spread"),
+            "equity_ratio": row.get("equity_ratio"),
+            "viability_score": row.get("viability_score"),
+            "viability_details": row.get("viability_details") or "",
         })
+
+    # Attach nested valuations and comps per property
+    conn2 = get_db(db_path)
+    for rec in records:
+        doc_num = rec["document_number"]
+        vals = get_valuations(conn2, doc_num)
+        rec["valuations"] = [
+            {
+                "source": v["source"],
+                "estimate": v["estimate"],
+                "source_url": v.get("source_url") or "",
+                "confidence": v.get("confidence") or "",
+                "comp_count": v.get("comp_count"),
+                "valued_at": v.get("valued_at") or "",
+            }
+            for v in vals
+        ]
+        comps = get_property_comps(conn2, doc_num)
+        rec["comps"] = [
+            {
+                "address": c["address"],
+                "sale_price": c["sale_price"],
+                "sale_date": c["sale_date"],
+                "distance_miles": c.get("distance_miles"),
+                "similarity_score": c.get("similarity_score"),
+                "lot_size_ratio": c.get("lot_size_ratio"),
+                "adjusted_price": c.get("adjusted_price"),
+                "sqft": c.get("sqft"),
+                "beds": c.get("beds"),
+                "baths": c.get("baths"),
+                "lot_size": c.get("lot_size"),
+                "year_built": c.get("year_built"),
+                "source": c.get("source") or "",
+                "source_id": c.get("source_id") or "",
+            }
+            for c in comps
+        ]
+    conn2.close()
 
     return records
 
@@ -346,11 +397,26 @@ def build_output(records: list[dict]) -> dict:
                       "absentee_owner", "assessed_value", "net_taxable_value",
                       "tax_rate", "total_tax",
                       "tax_status", "property_class", "acres",
-                      "estimated_market_value", "valuation_source",
-                      "valuation_confidence", "valued_at",
-                      "comps_estimate", "comps_count", "comps_confidence"):
+                      "estimated_market_value", "valued_at",
+                      "mortgage_amount", "mortgage_date", "mortgage_lender",
+                      "total_mortgage_debt", "mortgage_count",
+                      "mortgage_source",
+                      "federal_tax_lien_amount", "state_tax_lien_amount",
+                      "judgment_lien_amount", "total_recorded_liens",
+                      "lien_count",
+                      "total_lien_burden", "equity_spread", "equity_ratio",
+                      "viability_score", "viability_details"):
             if field in r:
                 feature[field] = r[field]
+        if "valuations" in r:
+            feature["valuations"] = r["valuations"]
+        if "comps" in r:
+            feature["comps"] = r["comps"]
+        # Compute estimated equity (legacy: mortgage-only)
+        emv = r.get("estimated_market_value")
+        debt = r.get("total_mortgage_debt")
+        if emv is not None and debt is not None:
+            feature["estimated_equity"] = round(emv - debt, 2)
         features.append(feature)
 
     return {
