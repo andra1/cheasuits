@@ -38,18 +38,18 @@ def test_valuations_table_exists(db):
 
 def test_upsert_valuation_inserts(db):
     """upsert_valuation inserts a new valuation row."""
-    upsert_valuation(db, "DOC001", {"source": "Zillow", "estimate": 250_000})
+    upsert_valuation(db, "DOC001", {"source": "zillow", "estimate": 250_000})
     rows = db.execute("SELECT * FROM valuations WHERE document_number = 'DOC001'").fetchall()
     assert len(rows) == 1
-    assert rows[0]["source"] == "Zillow"
+    assert rows[0]["source"] == "zillow"
     assert rows[0]["estimate"] == 250_000
     assert rows[0]["valued_at"] is not None
 
 
 def test_upsert_valuation_upserts(db):
     """upsert_valuation overwrites when same (document_number, source)."""
-    upsert_valuation(db, "DOC001", {"source": "Zillow", "estimate": 250_000})
-    upsert_valuation(db, "DOC001", {"source": "Zillow", "estimate": 275_000})
+    upsert_valuation(db, "DOC001", {"source": "zillow", "estimate": 250_000})
+    upsert_valuation(db, "DOC001", {"source": "zillow", "estimate": 275_000})
     rows = db.execute("SELECT * FROM valuations WHERE document_number = 'DOC001'").fetchall()
     assert len(rows) == 1
     assert rows[0]["estimate"] == 275_000
@@ -57,12 +57,12 @@ def test_upsert_valuation_upserts(db):
 
 def test_get_valuations(db):
     """get_valuations returns all valuation rows for a property."""
-    upsert_valuation(db, "DOC001", {"source": "Zillow", "estimate": 250_000})
-    upsert_valuation(db, "DOC001", {"source": "Redfin", "estimate": 260_000})
+    upsert_valuation(db, "DOC001", {"source": "zillow", "estimate": 250_000})
+    upsert_valuation(db, "DOC001", {"source": "redfin", "estimate": 260_000})
     vals = get_valuations(db, "DOC001")
     assert len(vals) == 2
     sources = {v["source"] for v in vals}
-    assert sources == {"Zillow", "Redfin"}
+    assert sources == {"zillow", "redfin"}
 
 
 # --- property_comps table ---
@@ -164,22 +164,22 @@ def test_get_property_comps(db):
 
 def test_apply_market_value_priority_redfin_wins_over_comps(db):
     """Redfin valuation should win over comps-only valuation."""
-    upsert_valuation(db, "DOC001", {"source": "Redfin", "estimate": 300_000})
+    upsert_valuation(db, "DOC001", {"source": "redfin", "estimate": 300_000})
     upsert_valuation(db, "DOC001", {"source": "comps", "estimate": 280_000})
     apply_market_value_priority(db, "DOC001")
     row = db.execute("SELECT estimated_market_value, valuation_source FROM properties WHERE document_number = 'DOC001'").fetchone()
     assert row["estimated_market_value"] == 300_000
-    assert row["valuation_source"] == "Redfin"
+    assert row["valuation_source"] == "redfin"
 
 
 def test_apply_market_value_priority_averages_redfin_zillow(db):
     """When both Redfin and Zillow exist, average them."""
-    upsert_valuation(db, "DOC001", {"source": "Redfin", "estimate": 300_000})
-    upsert_valuation(db, "DOC001", {"source": "Zillow", "estimate": 320_000})
+    upsert_valuation(db, "DOC001", {"source": "redfin", "estimate": 300_000})
+    upsert_valuation(db, "DOC001", {"source": "zillow", "estimate": 320_000})
     apply_market_value_priority(db, "DOC001")
     row = db.execute("SELECT estimated_market_value, valuation_source FROM properties WHERE document_number = 'DOC001'").fetchone()
     assert row["estimated_market_value"] == 310_000
-    assert row["valuation_source"] == "Zillow+Redfin"
+    assert row["valuation_source"] == "redfin+zillow"
 
 
 def test_apply_market_value_priority_comps_fallback(db):

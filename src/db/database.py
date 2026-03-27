@@ -1002,29 +1002,29 @@ def insert_property_comps(
     Each comp dict: comp_sale_id, distance_miles, similarity_score,
     lot_size_ratio, adjusted_price. Sets matched_at to now.
     """
-    conn.execute(
-        "DELETE FROM property_comps WHERE document_number = ?", (document_number,)
-    )
-    now = datetime.now().isoformat(timespec="seconds")
-    for c in comps:
+    with conn:
         conn.execute(
-            """
-            INSERT INTO property_comps
-                (document_number, comp_sale_id, distance_miles, similarity_score,
-                 lot_size_ratio, adjusted_price, matched_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?)
-            """,
-            (
-                document_number,
-                c["comp_sale_id"],
-                c.get("distance_miles"),
-                c.get("similarity_score"),
-                c.get("lot_size_ratio"),
-                c.get("adjusted_price"),
-                now,
-            ),
+            "DELETE FROM property_comps WHERE document_number = ?", (document_number,)
         )
-    conn.commit()
+        now = datetime.now().isoformat(timespec="seconds")
+        for c in comps:
+            conn.execute(
+                """
+                INSERT INTO property_comps
+                    (document_number, comp_sale_id, distance_miles, similarity_score,
+                     lot_size_ratio, adjusted_price, matched_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    document_number,
+                    c["comp_sale_id"],
+                    c.get("distance_miles"),
+                    c.get("similarity_score"),
+                    c.get("lot_size_ratio"),
+                    c.get("adjusted_price"),
+                    now,
+                ),
+            )
 
 
 def get_property_comps(conn: sqlite3.Connection, document_number: str) -> list[dict]:
@@ -1057,8 +1057,8 @@ def apply_market_value_priority(
         for row in get_valuations(conn, document_number)
     }
 
-    redfin = valuations.get("Redfin")
-    zillow = valuations.get("Zillow")
+    redfin = valuations.get("redfin")
+    zillow = valuations.get("zillow")
     comps = valuations.get("comps")
 
     market_value = None
@@ -1066,13 +1066,13 @@ def apply_market_value_priority(
 
     if redfin is not None and zillow is not None:
         market_value = (redfin + zillow) / 2
-        source_label = "Zillow+Redfin"
+        source_label = "redfin+zillow"
     elif redfin is not None:
         market_value = redfin
-        source_label = "Redfin"
+        source_label = "redfin"
     elif zillow is not None:
         market_value = zillow
-        source_label = "Zillow"
+        source_label = "zillow"
     elif comps is not None:
         market_value = comps
         source_label = "comps"
