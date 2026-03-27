@@ -33,6 +33,15 @@ CREATE TABLE IF NOT EXISTS properties (
     tax_status TEXT,
     property_class TEXT,
     acres REAL,
+    sqft REAL,
+    beds INTEGER,
+    baths REAL,
+    property_type TEXT,
+    year_built INTEGER,
+    stories INTEGER,
+    property_details_source TEXT,
+    property_details_at TEXT,
+    property_details_error TEXT,
     enriched_at TEXT,
     enrichment_error TEXT,
     lat REAL,
@@ -126,6 +135,32 @@ CREATE TABLE IF NOT EXISTS comparable_sales (
 );
 CREATE INDEX IF NOT EXISTS idx_comp_lat_lng ON comparable_sales(lat, lng);
 CREATE INDEX IF NOT EXISTS idx_comp_sale_date ON comparable_sales(sale_date);
+
+CREATE TABLE IF NOT EXISTS valuations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_number TEXT NOT NULL REFERENCES properties(document_number),
+    source TEXT NOT NULL,
+    estimate REAL NOT NULL,
+    source_url TEXT,
+    confidence TEXT,
+    comp_count INTEGER,
+    valued_at TEXT NOT NULL,
+    UNIQUE(document_number, source)
+);
+CREATE INDEX IF NOT EXISTS idx_valuations_doc ON valuations(document_number);
+
+CREATE TABLE IF NOT EXISTS property_comps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    document_number TEXT NOT NULL REFERENCES properties(document_number),
+    comp_sale_id INTEGER NOT NULL REFERENCES comparable_sales(id),
+    distance_miles REAL,
+    similarity_score REAL,
+    lot_size_ratio REAL,
+    adjusted_price REAL,
+    matched_at TEXT,
+    UNIQUE(document_number, comp_sale_id)
+);
+CREATE INDEX IF NOT EXISTS idx_property_comps_doc ON property_comps(document_number);
 """
 
 INGESTION_COLUMNS = [
@@ -190,6 +225,76 @@ def get_db(db_path: str | Path) -> sqlite3.Connection:
         "ALTER TABLE properties ADD COLUMN comps_updated_at TEXT",
     ]
     for stmt in _COMPS_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+    # Migrate: add mortgage enrichment columns to properties
+    _MORTGAGE_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN mortgage_amount REAL",
+        "ALTER TABLE properties ADD COLUMN mortgage_date TEXT",
+        "ALTER TABLE properties ADD COLUMN mortgage_lender TEXT",
+        "ALTER TABLE properties ADD COLUMN total_mortgage_debt REAL",
+        "ALTER TABLE properties ADD COLUMN mortgage_count INTEGER",
+        "ALTER TABLE properties ADD COLUMN mortgage_source TEXT",
+        "ALTER TABLE properties ADD COLUMN mortgage_enriched_at TEXT",
+        "ALTER TABLE properties ADD COLUMN mortgage_error TEXT",
+    ]
+    for stmt in _MORTGAGE_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+    # Migrate: add lien enrichment columns to properties
+    _LIEN_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN federal_tax_lien_amount REAL",
+        "ALTER TABLE properties ADD COLUMN state_tax_lien_amount REAL",
+        "ALTER TABLE properties ADD COLUMN judgment_lien_amount REAL",
+        "ALTER TABLE properties ADD COLUMN total_recorded_liens REAL",
+        "ALTER TABLE properties ADD COLUMN lien_count INTEGER",
+        "ALTER TABLE properties ADD COLUMN lien_enriched_at TEXT",
+        "ALTER TABLE properties ADD COLUMN lien_error TEXT",
+    ]
+    for stmt in _LIEN_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+    # Migrate: add property details columns to properties
+    _DETAILS_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN sqft REAL",
+        "ALTER TABLE properties ADD COLUMN beds INTEGER",
+        "ALTER TABLE properties ADD COLUMN baths REAL",
+        "ALTER TABLE properties ADD COLUMN property_type TEXT",
+        "ALTER TABLE properties ADD COLUMN year_built INTEGER",
+        "ALTER TABLE properties ADD COLUMN stories INTEGER",
+        "ALTER TABLE properties ADD COLUMN property_details_source TEXT",
+        "ALTER TABLE properties ADD COLUMN property_details_at TEXT",
+        "ALTER TABLE properties ADD COLUMN property_details_error TEXT",
+    ]
+    for stmt in _DETAILS_MIGRATIONS:
+        try:
+            conn.execute(stmt)
+        except sqlite3.OperationalError:
+            pass  # column already exists
+    conn.commit()
+
+    # Migrate: add viability scoring columns to properties
+    _VIABILITY_MIGRATIONS = [
+        "ALTER TABLE properties ADD COLUMN total_lien_burden REAL",
+        "ALTER TABLE properties ADD COLUMN equity_spread REAL",
+        "ALTER TABLE properties ADD COLUMN equity_ratio REAL",
+        "ALTER TABLE properties ADD COLUMN viability_score INTEGER",
+        "ALTER TABLE properties ADD COLUMN viability_details TEXT",
+        "ALTER TABLE properties ADD COLUMN viability_scored_at TEXT",
+    ]
+    for stmt in _VIABILITY_MIGRATIONS:
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
@@ -658,6 +763,53 @@ def get_comps_near(
     return [dict(row) for row in cursor.fetchall()]
 
 
+# ---------------------------------------------------------------------------
+# Mortgage enrichment helpers
+# ---------------------------------------------------------------------------
+
+def get_unmortgaged_properties(conn: sqlite3.Connection) -> list[dict]:
+    """Get properties that need mortgage enrichment."""
+    cursor = conn.execute(
+        "SELECT * FROM properties "
+        "WHERE mortgage_enriched_at IS NULL AND mortgage_error IS NULL "
+        "AND parcel_id != ''"
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_mortgage(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """Update mortgage fields on a property row."""
+    allowed = {
+        "mortgage_amount", "mortgage_date", "mortgage_lender",
+        "total_mortgage_debt", "mortgage_count", "mortgage_source",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    filtered["mortgage_enriched_at"] = datetime.now().isoformat(timespec="seconds")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
+    filtered["document_number"] = document_number
+
+    conn.execute(
+        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
+        filtered,
+    )
+    conn.commit()
+
+
+def set_mortgage_error(
+    conn: sqlite3.Connection, document_number: str, error: str
+) -> None:
+    """Record a mortgage enrichment failure."""
+    conn.execute(
+        "UPDATE properties SET mortgage_error = ?, mortgage_enriched_at = ? "
+        "WHERE document_number = ?",
+        (error, datetime.now().isoformat(timespec="seconds"), document_number),
+    )
+    conn.commit()
+
+
 def update_comps_valuation(
     conn: sqlite3.Connection, document_number: str, fields: dict
 ) -> None:
@@ -674,3 +826,261 @@ def update_comps_valuation(
         filtered,
     )
     conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Lien enrichment helpers
+# ---------------------------------------------------------------------------
+
+def get_unlienned_properties(conn: sqlite3.Connection) -> list[dict]:
+    """Get properties that need lien enrichment."""
+    cursor = conn.execute(
+        "SELECT * FROM properties "
+        "WHERE lien_enriched_at IS NULL AND lien_error IS NULL "
+        "AND parcel_id != ''"
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_liens(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """Update lien fields on a property row."""
+    allowed = {
+        "federal_tax_lien_amount", "state_tax_lien_amount",
+        "judgment_lien_amount", "total_recorded_liens", "lien_count",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    filtered["lien_enriched_at"] = datetime.now().isoformat(timespec="seconds")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
+    filtered["document_number"] = document_number
+
+    conn.execute(
+        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
+        filtered,
+    )
+    conn.commit()
+
+
+def set_lien_error(
+    conn: sqlite3.Connection, document_number: str, error: str
+) -> None:
+    """Record a lien enrichment failure."""
+    conn.execute(
+        "UPDATE properties SET lien_error = ?, lien_enriched_at = ? "
+        "WHERE document_number = ?",
+        (error, datetime.now().isoformat(timespec="seconds"), document_number),
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Viability scoring helpers
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Property details enrichment helpers
+# ---------------------------------------------------------------------------
+
+def get_undetailed_properties(conn: sqlite3.Connection) -> list[dict]:
+    """Get properties that need property details enrichment."""
+    cursor = conn.execute(
+        "SELECT * FROM properties "
+        "WHERE property_details_at IS NULL AND property_details_error IS NULL "
+        "AND property_address IS NOT NULL AND property_address != ''"
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def update_property_details(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """Update property detail fields on a property row."""
+    allowed = {
+        "sqft", "beds", "baths", "property_type", "year_built",
+        "stories", "property_details_source",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    filtered["property_details_at"] = datetime.now().isoformat(timespec="seconds")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
+    filtered["document_number"] = document_number
+
+    conn.execute(
+        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
+        filtered,
+    )
+    conn.commit()
+
+
+def set_property_details_error(
+    conn: sqlite3.Connection, document_number: str, error: str
+) -> None:
+    """Record a property details enrichment failure."""
+    conn.execute(
+        "UPDATE properties SET property_details_error = ?, property_details_at = ? "
+        "WHERE document_number = ?",
+        (error, datetime.now().isoformat(timespec="seconds"), document_number),
+    )
+    conn.commit()
+
+
+def update_viability(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """Update viability scoring fields on a property row."""
+    allowed = {
+        "total_lien_burden", "equity_spread", "equity_ratio",
+        "viability_score", "viability_details",
+    }
+    filtered = {k: v for k, v in fields.items() if k in allowed}
+    filtered["viability_scored_at"] = datetime.now().isoformat(timespec="seconds")
+
+    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
+    filtered["document_number"] = document_number
+
+    conn.execute(
+        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
+        filtered,
+    )
+    conn.commit()
+
+
+# ---------------------------------------------------------------------------
+# Valuations & property_comps helpers
+# ---------------------------------------------------------------------------
+
+def upsert_valuation(
+    conn: sqlite3.Connection, document_number: str, fields: dict
+) -> None:
+    """INSERT OR REPLACE a valuation row.
+
+    Required fields: source, estimate.
+    Optional: source_url, confidence, comp_count.
+    Always sets valued_at to now.
+    """
+    params = {
+        "document_number": document_number,
+        "source": fields["source"],
+        "estimate": fields["estimate"],
+        "source_url": fields.get("source_url"),
+        "confidence": fields.get("confidence"),
+        "comp_count": fields.get("comp_count"),
+        "valued_at": datetime.now().isoformat(timespec="seconds"),
+    }
+    conn.execute(
+        """
+        INSERT INTO valuations (document_number, source, estimate, source_url, confidence, comp_count, valued_at)
+        VALUES (:document_number, :source, :estimate, :source_url, :confidence, :comp_count, :valued_at)
+        ON CONFLICT(document_number, source) DO UPDATE SET
+            estimate = excluded.estimate,
+            source_url = excluded.source_url,
+            confidence = excluded.confidence,
+            comp_count = excluded.comp_count,
+            valued_at = excluded.valued_at
+        """,
+        params,
+    )
+    conn.commit()
+
+
+def get_valuations(conn: sqlite3.Connection, document_number: str) -> list[dict]:
+    """Return all valuation rows for a property, newest first."""
+    cursor = conn.execute(
+        "SELECT * FROM valuations WHERE document_number = ? ORDER BY valued_at DESC",
+        (document_number,),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def insert_property_comps(
+    conn: sqlite3.Connection, document_number: str, comps: list[dict]
+) -> None:
+    """Delete existing comp matches for this doc, then insert new ones.
+
+    Each comp dict: comp_sale_id, distance_miles, similarity_score,
+    lot_size_ratio, adjusted_price. Sets matched_at to now.
+    """
+    conn.execute(
+        "DELETE FROM property_comps WHERE document_number = ?", (document_number,)
+    )
+    now = datetime.now().isoformat(timespec="seconds")
+    for c in comps:
+        conn.execute(
+            """
+            INSERT INTO property_comps
+                (document_number, comp_sale_id, distance_miles, similarity_score,
+                 lot_size_ratio, adjusted_price, matched_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                document_number,
+                c["comp_sale_id"],
+                c.get("distance_miles"),
+                c.get("similarity_score"),
+                c.get("lot_size_ratio"),
+                c.get("adjusted_price"),
+                now,
+            ),
+        )
+    conn.commit()
+
+
+def get_property_comps(conn: sqlite3.Connection, document_number: str) -> list[dict]:
+    """JOIN property_comps with comparable_sales, sorted by similarity_score DESC."""
+    cursor = conn.execute(
+        """
+        SELECT pc.*, cs.address, cs.lat, cs.lng, cs.sale_price, cs.sale_date,
+               cs.property_type, cs.sqft, cs.beds, cs.baths, cs.lot_size,
+               cs.year_built, cs.source AS comp_source
+        FROM property_comps pc
+        JOIN comparable_sales cs ON pc.comp_sale_id = cs.id
+        WHERE pc.document_number = ?
+        ORDER BY pc.similarity_score DESC
+        """,
+        (document_number,),
+    )
+    return [dict(row) for row in cursor.fetchall()]
+
+
+def apply_market_value_priority(
+    conn: sqlite3.Connection, document_number: str
+) -> None:
+    """Apply priority rule to set estimated_market_value on the property.
+
+    Priority: avg(Zillow+Redfin) > single external > comps > NULL.
+    Updates properties.estimated_market_value, valuation_source, and valued_at.
+    """
+    valuations = {
+        row["source"]: row["estimate"]
+        for row in get_valuations(conn, document_number)
+    }
+
+    redfin = valuations.get("Redfin")
+    zillow = valuations.get("Zillow")
+    comps = valuations.get("comps")
+
+    market_value = None
+    source_label = None
+
+    if redfin is not None and zillow is not None:
+        market_value = (redfin + zillow) / 2
+        source_label = "Zillow+Redfin"
+    elif redfin is not None:
+        market_value = redfin
+        source_label = "Redfin"
+    elif zillow is not None:
+        market_value = zillow
+        source_label = "Zillow"
+    elif comps is not None:
+        market_value = comps
+        source_label = "comps"
+
+    if market_value is not None:
+        conn.execute(
+            "UPDATE properties SET estimated_market_value = ?, valuation_source = ?, valued_at = ? "
+            "WHERE document_number = ?",
+            (market_value, source_label, datetime.now().isoformat(timespec="seconds"), document_number),
+        )
+        conn.commit()
