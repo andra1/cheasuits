@@ -196,3 +196,19 @@ def test_apply_market_value_priority_no_valuations(db):
     apply_market_value_priority(db, "DOC001")
     row = db.execute("SELECT estimated_market_value, valuation_source FROM properties WHERE document_number = 'DOC001'").fetchone()
     assert row["estimated_market_value"] is None
+
+
+class TestFetchRefactored:
+    """Test that fetch functions return (estimate, url) tuples."""
+
+    def test_fetch_redfin_returns_tuple_on_failure(self):
+        from src.enrichment.valuation import fetch_redfin_estimate
+        result = fetch_redfin_estimate("99999 Nonexistent Blvd, Nowhere, ZZ 00000")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
+
+    def test_fetch_zillow_returns_tuple_on_failure(self):
+        from src.enrichment.valuation import fetch_zillow_estimate
+        result = fetch_zillow_estimate("99999 Nonexistent Blvd, Nowhere, ZZ 00000")
+        assert isinstance(result, tuple)
+        assert len(result) == 2
