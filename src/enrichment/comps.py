@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import logging
 import math
+from datetime import datetime, date
 from pathlib import Path
 
 logger = logging.getLogger(__name__)
@@ -19,9 +20,12 @@ logger = logging.getLogger(__name__)
 DEFAULT_DB = Path(__file__).resolve().parent.parent.parent / "data" / "cheasuits.db"
 
 # Scoring weights for comp selection
-WEIGHT_DISTANCE = 0.4
-WEIGHT_RECENCY = 0.3
-WEIGHT_LOT_SIZE = 0.3
+WEIGHT_SQFT = 0.5
+WEIGHT_DISTANCE = 0.3
+WEIGHT_RECENCY = 0.2
+
+# Hard filter: reject comps with sqft differing by more than this fraction
+SQFT_FILTER_THRESHOLD = 0.30
 
 # Maximum number of comps to use for estimation
 MAX_COMPS = 10
@@ -65,38 +69,53 @@ def bounding_box(lat: float, lng: float, radius_miles: float) -> tuple:
 # Comp finding and scoring
 # ---------------------------------------------------------------------------
 
+def _passes_sqft_filter(subject: dict, comp: dict) -> bool:
+    """Hard filter: reject comps whose sqft differs from subject by > 30%.
+
+    If either side is missing or zero sqft, the filter passes (no data to reject on).
+    """
+    subj_sqft = subject.get("sqft")
+    comp_sqft = comp.get("sqft")
+    if not subj_sqft or not comp_sqft:
+        return True
+    ratio = abs(comp_sqft - subj_sqft) / subj_sqft
+    return ratio <= SQFT_FILTER_THRESHOLD
+
+
 def _score_comp(subject: dict, comp: dict) -> float:
     """Score a comparable sale against the subject property (0-1, higher=better).
 
-    Factors: proximity (closer=better), recency (newer=better), lot size similarity.
+    Factors: sqft similarity (50%), proximity (30%), recency (20%).
     """
+    # Sqft similarity score
+    subj_sqft = subject.get("sqft")
+    comp_sqft = comp.get("sqft")
+    if subj_sqft and comp_sqft and subj_sqft > 0 and comp_sqft > 0:
+        ratio = min(subj_sqft, comp_sqft) / max(subj_sqft, comp_sqft)
+        sqft_score = ratio ** 3
+    elif subj_sqft and not comp_sqft:
+        # Missing comp sqft: apply penalty
+        sqft_score = 0.3
+    else:
+        sqft_score = 0.5  # neutral if subject has no sqft
+
     # Distance score: 0 at max_dist, 1 at 0 distance
     dist = comp.get("_distance", 0)
-    max_dist = 1.5  # miles
+    max_dist = 3.0  # miles
     dist_score = max(0, 1.0 - dist / max_dist)
 
-    # Recency score: based on days since sale (0 at 180 days, 1 at 0 days)
-    from datetime import datetime, date
+    # Recency score: based on days since sale (0 at 365 days, 1 at 0 days)
     try:
         sale_date = datetime.strptime(comp["sale_date"], "%Y-%m-%d").date()
         days_ago = (date.today() - sale_date).days
     except (ValueError, KeyError):
-        days_ago = 180
-    recency_score = max(0, 1.0 - days_ago / 180)
-
-    # Lot size similarity: 1 if identical, decays with divergence
-    subject_lot = subject.get("acres") or subject.get("lot_size")
-    comp_lot = comp.get("lot_size")
-    if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
-        ratio = min(subject_lot, comp_lot) / max(subject_lot, comp_lot)
-        lot_score = ratio
-    else:
-        lot_score = 0.5  # neutral if data missing
+        days_ago = 365
+    recency_score = max(0, 1.0 - days_ago / 365)
 
     return (
-        WEIGHT_DISTANCE * dist_score
+        WEIGHT_SQFT * sqft_score
+        + WEIGHT_DISTANCE * dist_score
         + WEIGHT_RECENCY * recency_score
-        + WEIGHT_LOT_SIZE * lot_score
     )
 
 
@@ -119,7 +138,7 @@ def find_comps(
 
     candidates = get_comps_near(conn, lat, lng, radius_miles, months_back)
 
-    # Post-filter with exact Haversine distance
+    # Post-filter with exact Haversine distance and sqft hard filter
     comps = []
     for c in candidates:
         if c.get("lat") is None or c.get("lng") is None:
@@ -127,6 +146,8 @@ def find_comps(
         dist = haversine_distance(lat, lng, c["lat"], c["lng"])
         if dist <= radius_miles:
             c["_distance"] = round(dist, 3)
+            if not _passes_sqft_filter(subject, c):
+                continue
             c["_score"] = round(_score_comp(subject, c), 3)
             comps.append(c)
 
@@ -143,31 +164,32 @@ def estimate_from_comps(
     subject: dict,
     comps: list[dict],
 ) -> tuple[float | None, int, str]:
-    """Estimate value from comparable sales using distance-weighted average.
+    """Estimate value from comparable sales using score-weighted average.
 
     Returns (estimated_value, comp_count, confidence).
     Confidence: "high" (3+), "medium" (2), "low" (1), None (0).
+
+    Applies sqft-based price adjustment: scales each comp's sale price by
+    subject_sqft / comp_sqft (clamped to 0.7–1.3) before averaging.
     """
     if not comps:
         return (None, 0, "")
 
-    # Distance-weighted average of sale prices, with lot size adjustment
-    subject_lot = subject.get("acres") or subject.get("lot_size")
+    subject_sqft = subject.get("sqft")
     total_weight = 0.0
     weighted_sum = 0.0
 
     for c in comps:
         price = c["sale_price"]
 
-        # Lot size adjustment: scale price by lot size ratio if both available
-        comp_lot = c.get("lot_size")
-        if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
-            lot_ratio = subject_lot / comp_lot
-            # Clamp adjustment to avoid extreme distortions
-            lot_ratio = max(0.5, min(2.0, lot_ratio))
-            price = price * lot_ratio
+        # Sqft-based price adjustment
+        comp_sqft = c.get("sqft")
+        if subject_sqft and comp_sqft and subject_sqft > 0 and comp_sqft > 0:
+            sqft_ratio = subject_sqft / comp_sqft
+            sqft_ratio = max(0.7, min(1.3, sqft_ratio))
+            price = price * sqft_ratio
 
-        # Weight by score (which already factors in distance, recency, lot similarity)
+        # Weight by score (which already factors in sqft similarity, distance, recency)
         weight = c.get("_score", 0.5)
         weighted_sum += price * weight
         total_weight += weight
@@ -246,24 +268,24 @@ def enrich_comps_from_db(
 
         # Write individual comp matches to property_comps
         comp_rows = []
+        subject_sqft = row.get("sqft")
         for c in comps:
             comp_id = c.get("id")
             if comp_id is None:
                 continue
 
-            subject_lot = row.get("acres") or row.get("lot_size")
-            comp_lot = c.get("lot_size")
-            if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
-                lot_ratio = max(0.5, min(2.0, subject_lot / comp_lot))
+            comp_sqft = c.get("sqft")
+            if subject_sqft and comp_sqft and subject_sqft > 0 and comp_sqft > 0:
+                sqft_ratio = max(0.7, min(1.3, subject_sqft / comp_sqft))
             else:
-                lot_ratio = 1.0
+                sqft_ratio = 1.0
 
             comp_rows.append({
                 "comp_sale_id": comp_id,
                 "distance_miles": c.get("_distance"),
                 "similarity_score": c.get("_score"),
-                "lot_size_ratio": round(lot_ratio, 4),
-                "adjusted_price": round(c["sale_price"] * lot_ratio, 2),
+                "lot_size_ratio": round(sqft_ratio, 4),
+                "adjusted_price": round(c["sale_price"] * sqft_ratio, 2),
             })
 
         if comp_rows:
