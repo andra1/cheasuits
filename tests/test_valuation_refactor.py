@@ -198,6 +198,23 @@ def test_apply_market_value_priority_no_valuations(db):
     assert row["estimated_market_value"] is None
 
 
+class TestCompsRefactoredOutput:
+    def test_estimate_from_comps_unchanged(self):
+        """Core estimation logic should still work."""
+        from src.enrichment.comps import estimate_from_comps
+        subject = {"acres": 0.2}
+        comps = [
+            {"sale_price": 150000, "lot_size": 0.2, "_score": 0.9, "_distance": 0.3,
+             "sale_date": "2026-01-15"},
+            {"sale_price": 170000, "lot_size": 0.25, "_score": 0.7, "_distance": 0.8,
+             "sale_date": "2026-02-01"},
+        ]
+        est, count, conf = estimate_from_comps(subject, comps)
+        assert est is not None
+        assert count == 2
+        assert conf == "medium"
+
+
 class TestFetchRefactored:
     """Test that fetch functions return (estimate, url) tuples."""
 

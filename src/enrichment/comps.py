@@ -197,12 +197,15 @@ def enrich_comps_from_db(
     radius_miles: float = 1.5,
     months_back: int = 6,
 ) -> None:
-    """Loop over properties with lat/lng, find comps, write estimates."""
-    from src.db.database import get_db, update_comps_valuation
+    """Loop over properties with lat/lng, find comps, write to property_comps
+    and valuations tables."""
+    from src.db.database import (
+        get_db, insert_property_comps, upsert_valuation,
+        apply_market_value_priority,
+    )
 
     conn = get_db(db_path)
 
-    # Get properties that have coordinates
     cursor = conn.execute(
         "SELECT * FROM properties WHERE lat IS NOT NULL AND lng IS NOT NULL"
     )
@@ -213,7 +216,6 @@ def enrich_comps_from_db(
         conn.close()
         return
 
-    # Check if we have any comps at all
     comp_count = conn.execute("SELECT COUNT(*) FROM comparable_sales").fetchone()[0]
     if comp_count == 0:
         print("No comparable sales in database. Run comps_redfin or comps_recorder first.")
@@ -242,11 +244,42 @@ def enrich_comps_from_db(
             no_comps += 1
             continue
 
-        update_comps_valuation(conn, doc_num, {
-            "comps_estimate": estimate,
-            "comps_count": count,
-            "comps_confidence": confidence,
+        # Write individual comp matches to property_comps
+        comp_rows = []
+        for c in comps:
+            comp_id = c.get("id")
+            if comp_id is None:
+                continue
+
+            subject_lot = row.get("acres") or row.get("lot_size")
+            comp_lot = c.get("lot_size")
+            if subject_lot and comp_lot and subject_lot > 0 and comp_lot > 0:
+                lot_ratio = max(0.5, min(2.0, subject_lot / comp_lot))
+            else:
+                lot_ratio = 1.0
+
+            comp_rows.append({
+                "comp_sale_id": comp_id,
+                "distance_miles": c.get("_distance"),
+                "similarity_score": c.get("_score"),
+                "lot_size_ratio": round(lot_ratio, 4),
+                "adjusted_price": round(c["sale_price"] * lot_ratio, 2),
+            })
+
+        if comp_rows:
+            insert_property_comps(conn, doc_num, comp_rows)
+
+        # Write summary to valuations table
+        upsert_valuation(conn, doc_num, {
+            "source": "comps",
+            "estimate": estimate,
+            "confidence": confidence,
+            "comp_count": count,
         })
+
+        # Apply priority rule
+        apply_market_value_priority(conn, doc_num)
+
         estimated += 1
         logger.info(
             f"[{i+1}/{len(rows)}] {doc_num} -> ${estimate:,.0f} "
