@@ -35,7 +35,7 @@ USER_AGENTS = [
     "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
 ]
 
-IMPERSONATE_BROWSERS = ["chrome131", "chrome130", "chrome124"]
+IMPERSONATE_BROWSERS = ["chrome131", "chrome133", "chrome124"]
 
 
 def _normalize_address(raw: str) -> str:
@@ -129,7 +129,16 @@ def fetch_zillow_estimate(address: str) -> tuple[Optional[float], Optional[str]]
         if match:
             page_data = json.loads(match.group(1))
             gdp_cache = page_data.get("props", {}).get("pageProps", {}).get("componentProps", {}).get("gdpClientCache", {})
+            # gdpClientCache may be a JSON string that needs a second parse
+            if isinstance(gdp_cache, str):
+                gdp_cache = json.loads(gdp_cache)
             for cache_val in gdp_cache.values():
+                # Values themselves may also be JSON strings
+                if isinstance(cache_val, str):
+                    try:
+                        cache_val = json.loads(cache_val)
+                    except (json.JSONDecodeError, ValueError):
+                        continue
                 if isinstance(cache_val, dict):
                     zest = cache_val.get("property", {}).get("zestimate")
                     if zest and isinstance(zest, (int, float)) and zest > 0:
