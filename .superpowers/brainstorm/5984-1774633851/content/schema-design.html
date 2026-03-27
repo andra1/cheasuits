@@ -1,0 +1,93 @@
+<h2>Section 1: Database Schema</h2>
+<p class="subtitle">Two new tables, columns removed from properties, denormalized market value stays</p>
+
+<div class="section">
+  <h3>New Table: <code>valuations</code></h3>
+  <div class="mockup">
+    <div class="mockup-header">valuations</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 13px; line-height: 1.8;">
+      <table style="width:100%; border-collapse: collapse;">
+        <tr style="border-bottom: 1px solid #444; color: #aaa;">
+          <th style="text-align:left; padding: 4px 8px;">Column</th>
+          <th style="text-align:left; padding: 4px 8px;">Type</th>
+          <th style="text-align:left; padding: 4px 8px;">Notes</th>
+        </tr>
+        <tr><td style="padding: 4px 8px; color: #f0c674;">id</td><td style="padding: 4px 8px;">INTEGER PK</td><td style="padding: 4px 8px;">autoincrement</td></tr>
+        <tr><td style="padding: 4px 8px; color: #f0c674;">document_number</td><td style="padding: 4px 8px;">TEXT FK</td><td style="padding: 4px 8px;">→ properties.document_number</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">source</td><td style="padding: 4px 8px;">TEXT NOT NULL</td><td style="padding: 4px 8px;">"zillow" | "redfin" | "comps"</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">estimate</td><td style="padding: 4px 8px;">REAL NOT NULL</td><td style="padding: 4px 8px;">dollar amount</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">source_url</td><td style="padding: 4px 8px;">TEXT</td><td style="padding: 4px 8px;">Zillow/Redfin property page URL (null for comps)</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">confidence</td><td style="padding: 4px 8px;">TEXT</td><td style="padding: 4px 8px;">"high" | "medium" | "low"</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">comp_count</td><td style="padding: 4px 8px;">INTEGER</td><td style="padding: 4px 8px;">only for source="comps"</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">valued_at</td><td style="padding: 4px 8px;">TEXT NOT NULL</td><td style="padding: 4px 8px;">ISO timestamp</td></tr>
+      </table>
+      <p style="margin-top: 12px; color: #999; font-size: 12px;">UNIQUE(document_number, source) — one estimate per source per property, upserted on re-runs</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>New Table: <code>property_comps</code></h3>
+  <div class="mockup">
+    <div class="mockup-header">property_comps</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 13px; line-height: 1.8;">
+      <table style="width:100%; border-collapse: collapse;">
+        <tr style="border-bottom: 1px solid #444; color: #aaa;">
+          <th style="text-align:left; padding: 4px 8px;">Column</th>
+          <th style="text-align:left; padding: 4px 8px;">Type</th>
+          <th style="text-align:left; padding: 4px 8px;">Notes</th>
+        </tr>
+        <tr><td style="padding: 4px 8px; color: #f0c674;">id</td><td style="padding: 4px 8px;">INTEGER PK</td><td style="padding: 4px 8px;">autoincrement</td></tr>
+        <tr><td style="padding: 4px 8px; color: #f0c674;">document_number</td><td style="padding: 4px 8px;">TEXT FK</td><td style="padding: 4px 8px;">→ properties.document_number (subject property)</td></tr>
+        <tr><td style="padding: 4px 8px; color: #f0c674;">comp_sale_id</td><td style="padding: 4px 8px;">INTEGER FK</td><td style="padding: 4px 8px;">→ comparable_sales.id</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">distance_miles</td><td style="padding: 4px 8px;">REAL</td><td style="padding: 4px 8px;">haversine distance</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">similarity_score</td><td style="padding: 4px 8px;">REAL</td><td style="padding: 4px 8px;">0-1 composite score (distance + recency + lot)</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">lot_size_ratio</td><td style="padding: 4px 8px;">REAL</td><td style="padding: 4px 8px;">subject_lot / comp_lot (clamped 0.5-2.0)</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">adjusted_price</td><td style="padding: 4px 8px;">REAL</td><td style="padding: 4px 8px;">sale_price * lot_size_ratio</td></tr>
+        <tr><td style="padding: 4px 8px; color: #81a2be;">matched_at</td><td style="padding: 4px 8px;">TEXT</td><td style="padding: 4px 8px;">ISO timestamp</td></tr>
+      </table>
+      <p style="margin-top: 12px; color: #999; font-size: 12px;">UNIQUE(document_number, comp_sale_id) — each comp linked once per subject property</p>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>Changes to <code>properties</code> table</h3>
+  <div class="mockup">
+    <div class="mockup-header">properties — columns affected</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 13px; line-height: 1.8;">
+      <p style="color: #cc6666; margin: 4px 0;"><strong>REMOVE:</strong></p>
+      <ul style="list-style: none; padding-left: 12px; color: #cc6666;">
+        <li>× assessed_multiplier_value</li>
+        <li>× zillow_estimate</li>
+        <li>× redfin_estimate</li>
+        <li>× comps_estimate</li>
+        <li>× comps_count</li>
+        <li>× comps_confidence</li>
+        <li>× comps_updated_at</li>
+        <li>× valuation_source</li>
+        <li>× valuation_confidence</li>
+        <li>× valuation_error</li>
+      </ul>
+      <p style="color: #b5bd68; margin: 12px 0 4px 0;"><strong>KEEP (denormalized):</strong></p>
+      <ul style="list-style: none; padding-left: 12px; color: #b5bd68;">
+        <li>✓ estimated_market_value — set by priority rule</li>
+        <li>✓ valued_at — when the winning estimate was recorded</li>
+      </ul>
+      <p style="color: #b5bd68; margin: 12px 0 4px 0;"><strong>KEEP (unchanged):</strong></p>
+      <ul style="list-style: none; padding-left: 12px; color: #b5bd68;">
+        <li>✓ assessed_value — raw county assessment, still useful</li>
+      </ul>
+    </div>
+  </div>
+</div>
+
+<div class="section">
+  <h3>New Table: <code>comparable_sales</code> — add <code>id</code> column</h3>
+  <div class="mockup">
+    <div class="mockup-header">comparable_sales — modification</div>
+    <div class="mockup-body" style="font-family: monospace; font-size: 13px; line-height: 1.8;">
+      <p style="color: #de935f;">Current PK is <code>(address, sale_date, sale_price)</code>. Add an <code>INTEGER PRIMARY KEY id</code> (autoincrement) so <code>property_comps</code> can reference individual rows cleanly. Keep the existing unique constraint as a dedup index.</p>
+    </div>
+  </div>
+</div>

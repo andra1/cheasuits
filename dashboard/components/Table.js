@@ -1,4 +1,5 @@
-import { Fragment, useState } from 'react';
+import { useState } from 'react';
+import { useRouter } from 'next/router';
 import ScoreBadge from './ScoreBadge';
 
 const TAX_BADGE = {
@@ -19,24 +20,30 @@ const CONFIDENCE_BADGE = {
   low: 'bg-red-100 text-red-800',
 };
 
-const CASE_LABELS = {
-  FC: 'Foreclosure',
-  CH: 'Chancery',
-  CV: 'Civil',
+const VIABILITY_BADGE = {
+  high:   'bg-green-100 text-green-800',
+  medium: 'bg-yellow-100 text-yellow-800',
+  low:    'bg-red-100 text-red-800',
 };
 
+function viabilityTier(score) {
+  if (score == null) return null;
+  if (score >= 65) return 'high';
+  if (score >= 35) return 'medium';
+  return 'low';
+}
+
 const COLUMNS = [
-  { key: 'score', label: 'Score' },
+  { key: 'viability_score', label: 'Viability' },
+  { key: 'score', label: 'Distress' },
   { key: 'case_number', label: 'Case #' },
   { key: 'recorded_date', label: 'Filed' },
   { key: 'owner_name', label: 'Owner' },
   { key: 'property_address', label: 'Address' },
   { key: 'estimated_market_value', label: 'Est. Value' },
+  { key: 'equity_spread', label: 'Equity Spread' },
   { key: 'tax_status', label: 'Tax Status' },
   { key: 'absentee_owner', label: 'Absentee' },
-  { key: 'property_class', label: 'Class' },
-  { key: 'acres', label: 'Acres' },
-  { key: 'parcel_id', label: 'Parcel' },
 ];
 
 function Badge({ text, className }) {
@@ -49,145 +56,26 @@ function Badge({ text, className }) {
 
 function SortArrow({ column, sortKey, sortDir }) {
   if (column !== sortKey) return <span className="text-gray-500 ml-1">&#8597;</span>;
-  return <span className="ml-1">{sortDir === 'asc' ? '▲' : '▼'}</span>;
-}
-
-function DetailField({ label, value }) {
-  if (value == null || value === '') return null;
-  return (
-    <div>
-      <dt className="text-xs text-gray-500 uppercase tracking-wide">{label}</dt>
-      <dd className="text-sm text-gray-900 mt-0.5">{value}</dd>
-    </div>
-  );
+  return <span className="ml-1">{sortDir === 'asc' ? '\u25B2' : '\u25BC'}</span>;
 }
 
 function formatCurrency(v) {
-  if (v == null) return '—';
+  if (v == null) return '\u2014';
   return '$' + Number(v).toLocaleString('en-US', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
 }
 
-function DetailPanel({ f }) {
-  return (
-    <div className="grid grid-cols-2 md:grid-cols-4 gap-x-8 gap-y-4 p-5 bg-gray-50 border-t border-b border-gray-200">
-      {/* Case Info */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Case Info</h4>
-        <DetailField label="Case Number" value={f.case_number} />
-        <DetailField
-          label="Case Type"
-          value={f.case_type ? `${f.case_type} — ${CASE_LABELS[f.case_type] || 'Other'}` : null}
-        />
-        <DetailField label="Filed" value={f.recorded_date} />
-        <DetailField label="Document #" value={f.document_number} />
-        <DetailField label="Defendant" value={f.party2} />
-      </div>
-
-      {/* Owner & Mailing */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Owner &amp; Mailing</h4>
-        <DetailField label="Owner" value={f.owner_name} />
-        <DetailField
-          label="Property Address"
-          value={f.property_address ? f.property_address.replace(/\n/g, ', ') : null}
-        />
-        <DetailField
-          label="Mailing Address"
-          value={f.mailing_address ? f.mailing_address.replace(/\n/g, ', ') : null}
-        />
-        <div>
-          <dt className="text-xs text-gray-500 uppercase tracking-wide">Absentee Owner</dt>
-          <dd className="mt-0.5">
-            {f.absentee_owner ? (
-              <Badge text="Yes" className="bg-orange-100 text-orange-800" />
-            ) : (
-              <Badge text="No" className="bg-gray-100 text-gray-600" />
-            )}
-          </dd>
-        </div>
-      </div>
-
-      {/* Valuation & Tax */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Valuation &amp; Tax</h4>
-        <DetailField label="Est. Market Value" value={f.estimated_market_value != null ? formatCurrency(f.estimated_market_value) : null} />
-        {f.valuation_source && (
-          <div>
-            <dt className="text-xs text-gray-500 uppercase tracking-wide">Valuation Source</dt>
-            <dd className="text-sm text-gray-900 mt-0.5 capitalize">{f.valuation_source.replace('_', ' ')}</dd>
-          </div>
-        )}
-        {f.valuation_confidence && (
-          <div>
-            <dt className="text-xs text-gray-500 uppercase tracking-wide">Confidence</dt>
-            <dd className="mt-0.5">
-              <Badge text={f.valuation_confidence} className={CONFIDENCE_BADGE[f.valuation_confidence] || 'bg-gray-100 text-gray-700'} />
-            </dd>
-          </div>
-        )}
-        {f.comps_estimate != null && (
-          <>
-            <DetailField label="Comps Estimate" value={formatCurrency(f.comps_estimate)} />
-            <div>
-              <dt className="text-xs text-gray-500 uppercase tracking-wide">Comps</dt>
-              <dd className="text-sm text-gray-900 mt-0.5">
-                {f.comps_count != null ? `${f.comps_count} comp${f.comps_count !== 1 ? 's' : ''}` : '—'}
-                {f.comps_confidence && (
-                  <Badge
-                    text={f.comps_confidence}
-                    className={`ml-1.5 ${CONFIDENCE_BADGE[f.comps_confidence] || 'bg-gray-100 text-gray-700'}`}
-                  />
-                )}
-              </dd>
-            </div>
-          </>
-        )}
-        <DetailField label="Assessed Value" value={formatCurrency(f.assessed_value)} />
-        <DetailField label="Net Taxable Value" value={formatCurrency(f.net_taxable_value)} />
-        <DetailField label="Tax Rate" value={f.tax_rate != null ? f.tax_rate : null} />
-        <DetailField label="Total Tax" value={f.total_tax != null ? formatCurrency(f.total_tax) : null} />
-        <div>
-          <dt className="text-xs text-gray-500 uppercase tracking-wide">Tax Status</dt>
-          <dd className="mt-0.5">
-            {f.tax_status ? (
-              <Badge text={f.tax_status} className={TAX_BADGE[f.tax_status] || 'bg-gray-100 text-gray-700'} />
-            ) : '—'}
-          </dd>
-        </div>
-      </div>
-
-      {/* Parcel Details */}
-      <div className="space-y-3">
-        <h4 className="text-xs font-bold text-gray-400 uppercase tracking-wider">Parcel Details</h4>
-        <DetailField label="Parcel ID" value={f.parcel_id} />
-        <DetailField label="Property Class" value={f.property_class} />
-        <DetailField label="Acres" value={f.acres != null ? f.acres : null} />
-        <DetailField label="Subdivision" value={f.subdivision} />
-        <div>
-          <dt className="text-xs text-gray-500 uppercase tracking-wide">Distress Score</dt>
-          <dd className="mt-0.5"><ScoreBadge value={f.score} /> <span className="text-xs text-gray-400">/ 100</span></dd>
-        </div>
-      </div>
-    </div>
-  );
-}
-
 export default function Table({ features }) {
-  const [sortKey, setSortKey] = useState('score');
+  const router = useRouter();
+  const [sortKey, setSortKey] = useState('viability_score');
   const [sortDir, setSortDir] = useState('desc');
-  const [expandedId, setExpandedId] = useState(null);
 
   function handleSort(key) {
     if (key === sortKey) {
       setSortDir(sortDir === 'asc' ? 'desc' : 'asc');
     } else {
       setSortKey(key);
-      setSortDir(key === 'score' || key === 'estimated_market_value' ? 'desc' : 'asc');
+      setSortDir(key === 'score' || key === 'viability_score' || key === 'estimated_market_value' || key === 'equity_spread' ? 'desc' : 'asc');
     }
-  }
-
-  function toggleRow(docNum) {
-    setExpandedId(expandedId === docNum ? null : docNum);
   }
 
   const sorted = [...features].sort((a, b) => {
@@ -207,6 +95,16 @@ export default function Table({ features }) {
 
   function renderCell(f, col) {
     switch (col.key) {
+      case 'viability_score': {
+        if (f.viability_score == null) return '\u2014';
+        const tier = viabilityTier(f.viability_score);
+        return (
+          <span className="flex items-center gap-1.5">
+            <span className="font-bold tabular-nums">{f.viability_score}</span>
+            <Badge text={tier} className={VIABILITY_BADGE[tier]} />
+          </span>
+        );
+      }
       case 'score':
         return <ScoreBadge value={f.score} />;
       case 'case_number':
@@ -222,9 +120,9 @@ export default function Table({ features }) {
           </span>
         );
       case 'owner_name':
-        return f.owner_name || f.party2 || '—';
+        return f.owner_name || f.party2 || '\u2014';
       case 'property_address':
-        return f.property_address ? f.property_address.replace(/\n/g, ', ') : '—';
+        return f.property_address ? f.property_address.replace(/\n/g, ', ') : '\u2014';
       case 'estimated_market_value':
         return f.estimated_market_value != null ? (
           <span className="flex items-center gap-1.5">
@@ -236,24 +134,33 @@ export default function Table({ features }) {
               />
             )}
           </span>
-        ) : '—';
+        ) : '\u2014';
+      case 'equity_spread': {
+        if (f.equity_spread == null) return '\u2014';
+        const isNeg = f.equity_spread < 0;
+        const ratio = f.equity_ratio != null ? ` (${Math.round(f.equity_ratio * 100)}%)` : '';
+        return (
+          <span className={isNeg ? 'text-red-600 font-medium' : 'text-green-700 font-medium'}>
+            {isNeg ? '-' : ''}{formatCurrency(Math.abs(f.equity_spread))}
+            <span className="text-xs opacity-75">{ratio}</span>
+          </span>
+        );
+      }
       case 'tax_status':
         return f.tax_status ? (
           <Badge
             text={f.tax_status}
             className={TAX_BADGE[f.tax_status] || 'bg-gray-100 text-gray-700'}
           />
-        ) : '—';
+        ) : '\u2014';
       case 'absentee_owner':
         return f.absentee_owner ? (
           <Badge text="Yes" className="bg-orange-100 text-orange-800" />
         ) : (
           <Badge text="No" className="bg-gray-100 text-gray-600" />
         );
-      case 'acres':
-        return f.acres != null ? f.acres : '—';
       default:
-        return f[col.key] ?? '—';
+        return f[col.key] ?? '\u2014';
     }
   }
 
@@ -275,36 +182,23 @@ export default function Table({ features }) {
           </tr>
         </thead>
         <tbody>
-          {sorted.map((f, i) => {
-            const isExpanded = expandedId === f.document_number;
-            return (
-              <Fragment key={f.document_number}>
-                <tr
-                  className={`cursor-pointer transition-colors ${
-                    isExpanded
-                      ? 'bg-blue-50'
-                      : i % 2 === 0
-                        ? 'bg-white hover:bg-gray-100'
-                        : 'bg-gray-50 hover:bg-gray-100'
-                  }`}
-                  onClick={() => toggleRow(f.document_number)}
-                >
-                  {COLUMNS.map((col) => (
-                    <td key={col.key} className="px-3 py-2 whitespace-nowrap">
-                      {renderCell(f, col)}
-                    </td>
-                  ))}
-                </tr>
-                {isExpanded && (
-                  <tr>
-                    <td colSpan={COLUMNS.length} className="p-0">
-                      <DetailPanel f={f} />
-                    </td>
-                  </tr>
-                )}
-              </Fragment>
-            );
-          })}
+          {sorted.map((f, i) => (
+            <tr
+              key={f.document_number}
+              className={`cursor-pointer transition-colors ${
+                i % 2 === 0
+                  ? 'bg-white hover:bg-gray-100'
+                  : 'bg-gray-50 hover:bg-gray-100'
+              }`}
+              onClick={() => router.push(`/property/${f.document_number}`)}
+            >
+              {COLUMNS.map((col) => (
+                <td key={col.key} className="px-3 py-2 whitespace-nowrap">
+                  {renderCell(f, col)}
+                </td>
+              ))}
+            </tr>
+          ))}
         </tbody>
       </table>
     </div>
