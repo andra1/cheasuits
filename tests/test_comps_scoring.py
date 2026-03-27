@@ -141,3 +141,64 @@ class TestEstimateFromComps:
         est, count, conf = estimate_from_comps(subject, comps)
         assert count == 3
         assert conf == "high"
+
+
+class TestZillowSoldScraper:
+    def test_parse_zillow_result(self):
+        from src.enrichment.comps_zillow import _parse_result
+
+        result = {
+            "zpid": "12345",
+            "address": "123 Main St, Belleville, IL 62220",
+            "addressStreet": "123 Main St",
+            "addressCity": "Belleville",
+            "addressState": "IL",
+            "addressZipcode": "62220",
+            "unformattedPrice": 185000,
+            "beds": 3,
+            "baths": 2,
+            "area": 1400,
+            "latLong": {"latitude": 38.52, "longitude": -89.98},
+            "hdpData": {
+                "homeInfo": {
+                    "dateSold": 1706745600000,
+                    "livingArea": 1400,
+                    "bedrooms": 3,
+                    "bathrooms": 2,
+                    "homeType": "SINGLE_FAMILY",
+                    "lotSize": 10890,
+                    "yearBuilt": 1990,
+                }
+            },
+        }
+
+        record = _parse_result(result)
+        assert record is not None
+        assert record["address"] == "123 Main St, Belleville, IL 62220"
+        assert record["sale_price"] == 185000
+        assert record["sqft"] == 1400
+        assert record["beds"] == 3
+        assert record["baths"] == 2
+        assert record["lat"] == 38.52
+        assert record["lng"] == -89.98
+        assert record["source"] == "zillow"
+        assert record["source_id"] == "12345"
+        assert record["year_built"] == 1990
+        assert record["sale_date"] == "2024-02-01"
+        assert record["lot_size"] == pytest.approx(0.25, abs=0.01)
+
+    def test_parse_result_missing_price(self):
+        from src.enrichment.comps_zillow import _parse_result
+        result = {"zpid": "12345", "address": "123 Main St"}
+        assert _parse_result(result) is None
+
+    def test_parse_result_zero_price(self):
+        from src.enrichment.comps_zillow import _parse_result
+        result = {
+            "zpid": "12345",
+            "address": "123 Main St",
+            "unformattedPrice": 0,
+            "latLong": {"latitude": 38.52, "longitude": -89.98},
+            "hdpData": {"homeInfo": {"dateSold": 1706745600000}},
+        }
+        assert _parse_result(result) is None
