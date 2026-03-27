@@ -14,9 +14,6 @@ from src.db.database import (
     get_ungeocoded,
     update_geocoding,
     get_all,
-    get_unvalued,
-    update_valuation,
-    set_valuation_error,
     upsert_vacancy_records,
     get_vacancy_by_tract,
     get_vacancy_summary,
@@ -168,59 +165,6 @@ class TestUpdateGeocoding:
         assert rows[0]["lat"] == 38.567890
         assert rows[0]["lng"] == -90.123456
         assert rows[0]["geocoded_at"] is not None
-
-
-class TestGetUnvalued:
-    def test_returns_unvalued_with_assessed_value(self, db):
-        upsert_records(db, [SAMPLE_RECORD])
-        update_enrichment(db, "2224358", {
-            "assessed_value": 12952.0,
-            "property_address": "209 Edwards St\nCahokia, IL 62206",
-        })
-        rows = get_unvalued(db)
-        assert len(rows) == 1
-
-    def test_excludes_already_valued(self, db):
-        upsert_records(db, [SAMPLE_RECORD])
-        update_enrichment(db, "2224358", {"assessed_value": 12952.0})
-        update_valuation(db, "2224358", {
-            "assessed_multiplier_value": 38856.0,
-            "estimated_market_value": 38856.0,
-            "valuation_source": "assessed_multiplier",
-            "valuation_confidence": "medium",
-        })
-        rows = get_unvalued(db)
-        assert len(rows) == 0
-
-    def test_excludes_no_assessed_value(self, db):
-        upsert_records(db, [SAMPLE_RECORD])
-        rows = get_unvalued(db)
-        assert len(rows) == 0
-
-    def test_excludes_errored(self, db):
-        upsert_records(db, [SAMPLE_RECORD])
-        update_enrichment(db, "2224358", {"assessed_value": 12952.0})
-        set_valuation_error(db, "2224358", "all methods failed")
-        rows = get_unvalued(db)
-        assert len(rows) == 0
-
-
-class TestUpdateValuation:
-    def test_sets_fields_and_timestamp(self, db):
-        upsert_records(db, [SAMPLE_RECORD])
-        update_valuation(db, "2224358", {
-            "assessed_multiplier_value": 38856.0,
-            "zillow_estimate": 42000.0,
-            "estimated_market_value": 42000.0,
-            "valuation_source": "zillow",
-            "valuation_confidence": "high",
-        })
-        rows = get_all(db)
-        row = rows[0]
-        assert row["estimated_market_value"] == 42000.0
-        assert row["valuation_source"] == "zillow"
-        assert row["valuation_confidence"] == "high"
-        assert row["valued_at"] is not None
 
 
 SAMPLE_VACANCY = {

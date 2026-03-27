@@ -181,28 +181,6 @@ def get_db(db_path: str | Path) -> sqlite3.Connection:
     conn.executescript(SCHEMA)
     conn.commit()
 
-    # Migrate: add valuation columns to existing databases
-    _VALUATION_MIGRATIONS = [
-        "ALTER TABLE properties ADD COLUMN assessed_multiplier_value REAL",
-        "ALTER TABLE properties ADD COLUMN zillow_estimate REAL",
-        "ALTER TABLE properties ADD COLUMN redfin_estimate REAL",
-        "ALTER TABLE properties ADD COLUMN estimated_market_value REAL",
-        "ALTER TABLE properties ADD COLUMN valuation_source TEXT",
-        "ALTER TABLE properties ADD COLUMN valuation_confidence TEXT",
-        "ALTER TABLE properties ADD COLUMN valued_at TEXT",
-        "ALTER TABLE properties ADD COLUMN valuation_error TEXT",
-    ]
-    for stmt in _VALUATION_MIGRATIONS:
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.commit()
-
-    # Create index on valued_at (after migration ensures column exists)
-    conn.execute("CREATE INDEX IF NOT EXISTS idx_valued_at ON properties(valued_at)")
-    conn.commit()
-
     # Migrate: add census tract columns to properties and delinquent_taxes
     _TRACT_MIGRATIONS = [
         "ALTER TABLE properties ADD COLUMN census_tract TEXT",
@@ -211,20 +189,6 @@ def get_db(db_path: str | Path) -> sqlite3.Connection:
         "ALTER TABLE delinquent_taxes ADD COLUMN tract_enriched_at TEXT",
     ]
     for stmt in _TRACT_MIGRATIONS:
-        try:
-            conn.execute(stmt)
-        except sqlite3.OperationalError:
-            pass  # column already exists
-    conn.commit()
-
-    # Migrate: add comps valuation columns to properties
-    _COMPS_MIGRATIONS = [
-        "ALTER TABLE properties ADD COLUMN comps_estimate REAL",
-        "ALTER TABLE properties ADD COLUMN comps_count INTEGER",
-        "ALTER TABLE properties ADD COLUMN comps_confidence TEXT",
-        "ALTER TABLE properties ADD COLUMN comps_updated_at TEXT",
-    ]
-    for stmt in _COMPS_MIGRATIONS:
         try:
             conn.execute(stmt)
         except sqlite3.OperationalError:
@@ -381,16 +345,6 @@ def get_ungeocoded(conn: sqlite3.Connection) -> list[dict]:
     return [dict(row) for row in cursor.fetchall()]
 
 
-def get_unvalued(conn: sqlite3.Connection) -> list[dict]:
-    """Get rows that need valuation (have assessed_value but no valuation yet)."""
-    cursor = conn.execute(
-        "SELECT * FROM properties "
-        "WHERE valued_at IS NULL AND valuation_error IS NULL "
-        "AND assessed_value IS NOT NULL"
-    )
-    return [dict(row) for row in cursor.fetchall()]
-
-
 def update_geocoding(
     conn: sqlite3.Connection, document_number: str, lat: float, lng: float
 ) -> None:
@@ -399,39 +353,6 @@ def update_geocoding(
         "UPDATE properties SET lat = ?, lng = ?, geocoded_at = ? "
         "WHERE document_number = ?",
         (lat, lng, datetime.now().isoformat(timespec="seconds"), document_number),
-    )
-    conn.commit()
-
-
-def update_valuation(
-    conn: sqlite3.Connection, document_number: str, fields: dict
-) -> None:
-    """Update valuation fields and set valued_at timestamp."""
-    allowed = {
-        "assessed_multiplier_value", "zillow_estimate", "redfin_estimate",
-        "comps_estimate", "estimated_market_value", "valuation_source",
-        "valuation_confidence",
-    }
-    filtered = {k: v for k, v in fields.items() if k in allowed}
-    filtered["valued_at"] = datetime.now().isoformat(timespec="seconds")
-
-    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
-    filtered["document_number"] = document_number
-
-    conn.execute(
-        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
-        filtered,
-    )
-    conn.commit()
-
-
-def set_valuation_error(
-    conn: sqlite3.Connection, document_number: str, error: str
-) -> None:
-    """Record a valuation failure so the property is skipped on re-run."""
-    conn.execute(
-        "UPDATE properties SET valuation_error = ? WHERE document_number = ?",
-        (error, document_number),
     )
     conn.commit()
 
@@ -806,24 +727,6 @@ def set_mortgage_error(
         "UPDATE properties SET mortgage_error = ?, mortgage_enriched_at = ? "
         "WHERE document_number = ?",
         (error, datetime.now().isoformat(timespec="seconds"), document_number),
-    )
-    conn.commit()
-
-
-def update_comps_valuation(
-    conn: sqlite3.Connection, document_number: str, fields: dict
-) -> None:
-    """Write comps_estimate, comps_count, comps_confidence to a property row."""
-    allowed = {"comps_estimate", "comps_count", "comps_confidence"}
-    filtered = {k: v for k, v in fields.items() if k in allowed}
-    filtered["comps_updated_at"] = datetime.now().isoformat(timespec="seconds")
-
-    set_clause = ", ".join(f"{k} = :{k}" for k in filtered)
-    filtered["document_number"] = document_number
-
-    conn.execute(
-        f"UPDATE properties SET {set_clause} WHERE document_number = :document_number",
-        filtered,
     )
     conn.commit()
 
