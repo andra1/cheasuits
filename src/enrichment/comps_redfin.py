@@ -13,12 +13,14 @@ import argparse
 import csv
 import io
 import logging
+import random
 import re
-import urllib.error
+import time
 import urllib.parse
-import urllib.request
 from datetime import datetime, timedelta
 from pathlib import Path
+
+from curl_cffi import requests as cffi_requests
 
 logger = logging.getLogger(__name__)
 
@@ -36,12 +38,9 @@ REDFIN_PARAMS = {
     "uipt": "1,2,3,4,5,6",   # all property types
 }
 
-USER_AGENT = (
-    "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
-)
-
+IMPERSONATE_BROWSERS = ["chrome131", "chrome124"]
 MAX_RETRIES = 3
+PAGE_DELAY = 2.0
 
 
 # ---------------------------------------------------------------------------
@@ -192,43 +191,68 @@ def _parse_redfin_csv(csv_text: str, sold_within_days: int = 180) -> list[dict]:
 def fetch_redfin_sold(sold_within_days: int = 180) -> list[dict]:
     """Fetch recently sold properties from Redfin's gis-csv endpoint.
 
+    Uses curl_cffi with browser impersonation to avoid bot detection.
+    Fetches multiple sold_within_days windows to maximize record count.
+
     Returns list of records ready for comparable_sales table.
     """
-    params = dict(REDFIN_PARAMS)
-    params["sold_within_days"] = str(sold_within_days)
+    browser = random.choice(IMPERSONATE_BROWSERS)
+    session = cffi_requests.Session(impersonate=browser)
+    all_records: list[dict] = []
+    seen_keys: set[tuple[str, str]] = set()  # (address, sale_date) dedup
 
-    url = f"{REDFIN_GIS_CSV_URL}?{urllib.parse.urlencode(params)}"
-    logger.info(f"Fetching Redfin sold data: {url}")
+    # Fetch multiple time windows to get more records since the endpoint
+    # caps results per request
+    windows = [
+        sold_within_days,
+        min(sold_within_days, 90),
+        min(sold_within_days, 30),
+    ]
 
-    for attempt in range(1, MAX_RETRIES + 1):
-        try:
-            req = urllib.request.Request(url, headers={
-                "User-Agent": USER_AGENT,
-                "Accept": "text/csv,application/csv,*/*",
-            })
-            with urllib.request.urlopen(req, timeout=30) as resp:
-                csv_text = resp.read().decode("utf-8")
+    for window in windows:
+        params = dict(REDFIN_PARAMS)
+        params["sold_within_days"] = str(window)
 
-            if not csv_text or len(csv_text) < 50:
-                logger.warning("Redfin returned empty or tiny response")
-                return []
+        url = f"{REDFIN_GIS_CSV_URL}?{urllib.parse.urlencode(params)}"
+        logger.info(f"Fetching Redfin sold data (window={window}d): {url}")
 
-            records = _parse_redfin_csv(csv_text, sold_within_days)
-            logger.info(f"Parsed {len(records)} sold records from Redfin CSV")
-            return records
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                resp = session.get(url, headers={
+                    "Accept": "text/csv,application/csv,*/*",
+                }, timeout=30)
+                resp.raise_for_status()
+                csv_text = resp.text
 
-        except urllib.error.HTTPError as e:
-            logger.warning(f"Redfin HTTP {e.code} on attempt {attempt}/{MAX_RETRIES}")
-            if attempt == MAX_RETRIES:
-                logger.error(f"Redfin fetch failed after {MAX_RETRIES} attempts: {e}")
-                return []
-        except Exception as e:
-            logger.warning(f"Redfin fetch attempt {attempt}/{MAX_RETRIES} failed: {e}")
-            if attempt == MAX_RETRIES:
-                logger.error(f"Redfin fetch failed after {MAX_RETRIES} attempts: {e}")
-                return []
+                if not csv_text or len(csv_text) < 50:
+                    logger.warning("Redfin returned empty or tiny response")
+                    break
 
-    return []
+                records = _parse_redfin_csv(csv_text, window)
+                new_count = 0
+                for rec in records:
+                    key = (rec["address"], rec["sale_date"])
+                    if key not in seen_keys:
+                        seen_keys.add(key)
+                        all_records.append(rec)
+                        new_count += 1
+                logger.info(
+                    f"Parsed {len(records)} records from window={window}d, "
+                    f"{new_count} new (total: {len(all_records)})"
+                )
+                break
+
+            except Exception as e:
+                logger.warning(f"Redfin fetch attempt {attempt}/{MAX_RETRIES} failed: {e}")
+                if attempt < MAX_RETRIES:
+                    time.sleep(PAGE_DELAY * attempt)
+                else:
+                    logger.error(f"Redfin fetch failed after {MAX_RETRIES} attempts: {e}")
+
+        time.sleep(PAGE_DELAY)
+
+    logger.info(f"Total Redfin sold records: {len(all_records)}")
+    return all_records
 
 
 # ---------------------------------------------------------------------------
